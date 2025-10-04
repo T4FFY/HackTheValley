@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Play, Trash2, Download, Zap, Lightbulb, Bot } from "lucide-react";
+import { Play, Trash2, Zap, Lightbulb, Bot } from "lucide-react";
 import "./App.css";
 
 const BlocklyRobotController = () => {
@@ -37,7 +37,7 @@ const BlocklyRobotController = () => {
         setTimeout(() => {
           initBlockly();
           setLoaded(true);
-        }, 100);
+        }, 300);
       } catch (error) {
         console.error("Error loading Blockly:", error);
       }
@@ -102,7 +102,7 @@ const BlocklyRobotController = () => {
           .appendField("seconds");
         this.setPreviousStatement(true, null);
         this.setNextStatement(true, null);
-        this.setColour("#2196F3");
+        this.setColour("#4CAF50");
         this.setTooltip("Turn the robot");
         this.setHelpUrl("");
       },
@@ -149,7 +149,7 @@ const BlocklyRobotController = () => {
         this.setPreviousStatement(true, null);
         this.setNextStatement(true, null);
         this.setColour("#9C27B0");
-        this.setTooltip("Display message on OLED screen");
+        this.setTooltip("Display message on LED screen");
         this.setHelpUrl("");
       },
     };
@@ -193,7 +193,7 @@ const BlocklyRobotController = () => {
 
     window.Blockly.JavaScript["robot_oled"] = function (block) {
       const message = block.getFieldValue("MESSAGE");
-      return `robot.displayOLED('${message}');\n`;
+      return `robot.displayLED('${message}');\n`;
     };
 
     window.Blockly.JavaScript["robot_fan"] = function (block) {
@@ -207,7 +207,7 @@ const BlocklyRobotController = () => {
       contents: [
         {
           kind: "category",
-          name: "🚗 Movement",
+          name: "Motion",
           colour: "#4CAF50",
           contents: [
             { kind: "block", type: "robot_move" },
@@ -216,31 +216,31 @@ const BlocklyRobotController = () => {
         },
         {
           kind: "category",
-          name: "💡 Lights",
+          name: "Light",
           colour: "#FF9800",
           contents: [{ kind: "block", type: "robot_light" }],
         },
         {
           kind: "category",
-          name: "🔊 Sound",
+          name: "Buzzer",
           colour: "#E91E63",
           contents: [{ kind: "block", type: "robot_buzzer" }],
         },
         {
           kind: "category",
-          name: "📺 Display",
+          name: "LED",
           colour: "#9C27B0",
           contents: [{ kind: "block", type: "robot_oled" }],
         },
         {
           kind: "category",
-          name: "🌀 Fan",
+          name: "Fan",
           colour: "#00BCD4",
           contents: [{ kind: "block", type: "robot_fan" }],
         },
         {
           kind: "category",
-          name: "🔁 Loops",
+          name: "Control",
           colour: "#673AB7",
           contents: [
             {
@@ -280,24 +280,10 @@ const BlocklyRobotController = () => {
                 },
               },
             },
-          ],
-        },
-        {
-          kind: "category",
-          name: "🧠 Logic",
-          colour: "#795548",
-          contents: [
             { kind: "block", type: "controls_if" },
             { kind: "block", type: "logic_compare" },
             { kind: "block", type: "logic_operation" },
             { kind: "block", type: "logic_boolean" },
-          ],
-        },
-        {
-          kind: "category",
-          name: "🔢 Math",
-          colour: "#607D8B",
-          contents: [
             { kind: "block", type: "math_number" },
             { kind: "block", type: "math_arithmetic" },
           ],
@@ -326,6 +312,13 @@ const BlocklyRobotController = () => {
       sounds: true,
       theme: window.Blockly.Themes.Classic,
     });
+
+    // Force render after injection
+    setTimeout(() => {
+      if (workspaceRef.current) {
+        window.Blockly.svgResize(workspaceRef.current);
+      }
+    }, 0);
   };
 
   const generateCode = () => {
@@ -379,10 +372,22 @@ const BlocklyRobotController = () => {
         </div>
 
         <div className="main-card">
-          {/* Main Content */}
-          <div className="grid-layout">
-            {/* Blockly Workspace */}
-            <div className="workspace-column">
+          {/* Robot Instructions - At Top */}
+          <div className="robot-instructions">
+            <h3 className="instructions-title">
+              <Lightbulb className="instructions-icon" />
+              Robot Instructions
+            </h3>
+            <pre className="instructions-content">
+              {output ||
+                '👋 Hi there, young coder!\n\nDrag blocks from the colorful menu on the left and snap them together to create your robot program.\n\n💡 Try this:\n1. Click "Motion"\n2. Drag a move block here\n3. Click "Run My Program!"'}
+            </pre>
+          </div>
+
+          {/* Two Column Layout */}
+          <div className="two-column-layout">
+            {/* Left Column - Blockly Workspace */}
+            <div className="workspace-wrapper">
               <div className="blockly-container">
                 {!loaded && (
                   <div className="loading-container">
@@ -440,9 +445,8 @@ const BlocklyRobotController = () => {
               </div>
             </div>
 
-            {/* Output Panel */}
-            <div className="output-column">
-              {/* Generated Code */}
+            {/* Right Column - Your Code */}
+            <div className="code-wrapper">
               <div className="code-panel">
                 <div className="code-header">
                   <div className="code-dots">
@@ -457,18 +461,6 @@ const BlocklyRobotController = () => {
                     '// Drag blocks and click "Run" to see your code here!\n// Let\'s create something awesome! 🚀'}
                 </pre>
               </div>
-
-              {/* Execution Output */}
-              <div className="output-panel">
-                <h3 className="output-title">
-                  <Lightbulb className="output-icon" />
-                  Robot Instructions
-                </h3>
-                <pre className="output-content">
-                  {output ||
-                    '👋 Hi there, young coder!\n\nDrag blocks from the colorful menu on the left and snap them together to create your robot program.\n\n💡 Try this:\n1. Click "🚗 Movement"\n2. Drag a move block here\n3. Click "Run My Program!"'}
-                </pre>
-              </div>
             </div>
           </div>
 
@@ -477,34 +469,36 @@ const BlocklyRobotController = () => {
             <h3 className="footer-title">
               🎮 Quick Guide - Make Your Robot Come Alive!
             </h3>
-            <div className="guide-grid">
+            <div className="guide-grid-6">
               <div className="guide-card guide-card-green">
                 <div className="guide-emoji">🚗</div>
-                <strong className="guide-heading">Movement</strong>
-                <p className="guide-text">
-                  Make your robot go forward, backward, left, or right!
-                </p>
+                <strong className="guide-heading">Motion</strong>
+                <p className="guide-text">Move & turn</p>
               </div>
               <div className="guide-card guide-card-orange">
-                <div className="guide-emoji">💡🔊</div>
-                <strong className="guide-heading">Lights & Sounds</strong>
-                <p className="guide-text">
-                  Pick colors and play buzzer sounds!
-                </p>
+                <div className="guide-emoji">💡</div>
+                <strong className="guide-heading">Light</strong>
+                <p className="guide-text">Pick colors</p>
+              </div>
+              <div className="guide-card guide-card-pink">
+                <div className="guide-emoji">🔊</div>
+                <strong className="guide-heading">Buzzer</strong>
+                <p className="guide-text">Play sounds</p>
               </div>
               <div className="guide-card guide-card-purple">
-                <div className="guide-emoji">📺🌀</div>
-                <strong className="guide-heading">Display & Fan</strong>
-                <p className="guide-text">
-                  Show messages and control the fan speed!
-                </p>
+                <div className="guide-emoji">📺</div>
+                <strong className="guide-heading">LED</strong>
+                <p className="guide-text">Show messages</p>
               </div>
-              <div className="guide-card guide-card-blue">
+              <div className="guide-card guide-card-cyan">
+                <div className="guide-emoji">🌀</div>
+                <strong className="guide-heading">Fan</strong>
+                <p className="guide-text">Control speed</p>
+              </div>
+              <div className="guide-card guide-card-violet">
                 <div className="guide-emoji">🔁</div>
-                <strong className="guide-heading">Loops</strong>
-                <p className="guide-text">
-                  Repeat actions multiple times automatically!
-                </p>
+                <strong className="guide-heading">Control</strong>
+                <p className="guide-text">Loops & logic</p>
               </div>
             </div>
           </div>
