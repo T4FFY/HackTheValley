@@ -1,23 +1,191 @@
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include <ArduinoJson.h>
+// ESP32 (Arduino Core 3.x)
+// SoftAP + Web UI with 3 test buttons:
+//  - Beep once
+//  - Play note (name + beats)
+//  - Mary Had a Little Lamb
+//
+// Endpoints:
+//   GET /beep
+//   GET /note?name=C4&beats=1
+//   GET /mary
+//
+// Works great with a passive buzzer on GPIO 26 (change BUZZER_PIN if needed).
 
-AsyncWebServer server(80);
+#include <WiFi.h>
+#include <WebServer.h>
 
-void setup(){
-  WiFi.begin("SSID","PASS");
-  while(WiFi.status() != WL_CONNECTED) delay(200);
-  server.on("/cmd", HTTP_POST, [](AsyncWebServerRequest *request){
-    // this callback is called after the body is fully received (we use onRequestBody below)
-    request->send(200, "application/json", "{\"status\":\"ok\"}");
-  }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-    // body arrives here
-    StaticJsonDocument<1024> doc;
-    auto err = deserializeJson(doc, (const char*)data, len);
-    if (!err) {
-      handleJsonCommand(doc.as<JsonObject>(), nullptr); // same dispatcher as WS
-    }
-  });
+// ====== Access Point config ======
+const char* AP_SSID     = "esp32-bot";
+const char* AP_PASSWORD = "hackme123";  // set "" for open AP
+
+// ====== Buzzer config ======
+const int   BUZZER_PIN  = 26;     // passive buzzer + -> this pin, - -> GND
+const uint8_t PWM_RES   = 8;      // LEDC resolution bits
+const int   TEMPO_BPM   = 120;    // beats per minute for "beats" math
+// 1 beat in ms:
+const int   BEAT_MS     = 60000 / TEMPO_BPM;
+
+// ====== HTTP server ======
+WebServer server(80);
+
+// ---- Simple note table (common notes C3..C6). Add more if you like.
+struct NoteMap { const char* name; uint16_t freq; };
+static const NoteMap NOTES[] = {
+  // C3..B3
+  {"C3", 131}, {"D3", 147}, {"E3", 165}, {"F3", 175}, {"G3", 196}, {"A3", 220}, {"B3", 247},
+  // C4..B4 (middle C = C4)
+  {"C4", 262}, {"D4", 294}, {"E4", 330}, {"F4", 349}, {"G4", 392}, {"A4", 440}, {"B4", 494},
+  // C5..B5
+  {"C5", 523}, {"D5", 587}, {"E5", 659}, {"F5", 698}, {"G5", 784}, {"A5", 880}, {"B5", 988},
+  // C6..G6 (just a few higher)
+  {"C6", 1047}, {"D6", 1175}, {"E6", 1319}, {"F6", 1397}, {"G6", 1568}
+};
+// Look up frequency (Hz) by note name, returns 0 if not found (treated as rest)
+uint16_t noteFreq(const String& name) {
+  for (auto &n : NOTES) {
+    if (name.equalsIgnoreCase(n.name)) return n.freq;
+  }
+  return 0;
+}
+
+// ---- Buzzer helpers ----
+void toneMs(uint16_t freqHz, uint16_t durationMs) {
+  if (freqHz == 0 || durationMs == 0) return;
+  ledcWriteTone(BUZZER_PIN, freqHz);
+  delay(durationMs);
+  ledcWriteTone(BUZZER_PIN, 0);
+}
+
+// Beep once: 2 kHz, 500 ms
+void beepOnce() { toneMs(2000, 500); }
+
+// Play one musical note for X beats (blocking)
+void playNoteBeats(const String& name, float beats) {
+  uint16_t f = noteFreq(name);
+  int dur = max(1, int(beats * BEAT_MS));
+  if (f == 0) {
+    // Treat unknown/REST as short pause
+    delay(dur);
+  } else {
+    toneMs(f, dur);
+  }
+}
+
+// ---- Mary Had a Little Lamb (in key of C, one-beat notes) ----
+// Melody: E D C D E E E | D D D | E G G | E D C D E E E E | D D E D C
+// Durations: mostly quarter notes (1 beat), a few 2-beat notes
+const char* MARY_NOTES[] = {
+  "E4","D4","C4","D4","E4","E4","E4",
+  "D4","D4","D4","E4","G4","G4",
+  "E4","D4","C4","D4","E4","E4","E4","E4",
+  "D4","D4","E4","D4","C4"
+};
+const float MARY_BEATS[] = {
+  1,1,1,1,1,1,2,
+  1,1,2,1,1,2,
+  1,1,1,1,1,1,1,1,
+  1,1,1,1,2
+};
+const size_t MARY_LEN = sizeof(MARY_BEATS)/sizeof(MARY_BEATS[0]);
+
+void playMary() {
+  for (size_t i = 0; i < MARY_LEN; ++i) {
+    playNoteBeats(String(MARY_NOTES[i]), MARY_BEATS[i]);
+    // Tiny gap between notes for clarity (10% of a beat)
+    delay(int(BEAT_MS * 0.1));
+  }
+}
+
+// ---- Simple HTML UI (3 test controls) ----
+String htmlPage() {
+  String ip = WiFi.softAPIP().toString();
+  String page =
+    "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'/>"
+    "<title>ESP32 Buzzer</title>"
+    "<style>"
+    "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f6f7fb;margin:0;padding:24px}"
+    ".card{max-width:720px;margin:0 auto;background:#fff;padding:24px 28px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,.08)}"
+    "h1{margin:0 0 8px 0;font-size:24px}"
+    "p{color:#444}"
+    ".row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 18px}"
+    "input,select{font-size:16px;padding:10px 12px;border:1px solid #ddd;border-radius:10px}"
+    "button{font-size:16px;padding:12px 18px;border:none;border-radius:10px;cursor:pointer;background:#4CAF50;color:#fff}"
+    "button:active{transform:translateY(1px)}"
+    ".hint{color:#777;font-size:14px}"
+    "</style></head><body><div class='card'>"
+    "<h1>ESP32 Buzzer (AP mode)</h1>"
+    "<p>Connect to Wi-Fi <b>esp32-bot</b> (pwd <code>hackme123</code>). This page is served from <code>http://" + ip + "/</code>.</p>"
+
+    "<h3>1) Beep Once</h3>"
+    "<div class='row'>"
+      "<form action='/beep' method='get'><button>Beep!</button></form>"
+    "</div>"
+
+    "<h3>2) Play a Note</h3>"
+    "<form action='/note' method='get' class='row'>"
+      "<label>Note&nbsp;<input name='name' placeholder='e.g., C4, E4, G5' required></label>"
+      "<label>Beats&nbsp;<input name='beats' type='number' min='0.1' step='0.1' value='1' required></label>"
+      "<button>Play Note</button>"
+    "</form>"
+    "<div class='hint'>Supported notes include C3..B5 and a few higher; unknown names act as a rest.</div>"
+
+    "<h3>3) Mary Had a Little Lamb</h3>"
+    "<div class='row'>"
+      "<form action='/mary' method='get'><button>Play Mary</button></form>"
+    "</div>"
+
+    "<p class='hint'>API: <code>GET /beep</code>, <code>GET /note?name=C4&beats=1</code>, <code>GET /mary</code></p>"
+    "</div></body></html>";
+  return page;
+}
+
+// ---- Handlers ----
+void handleRoot() { server.send(200, "text/html", htmlPage()); }
+
+void handleBeepGET() {
+  beepOnce();
+  handleRoot();
+}
+
+void handleNoteGET() {
+  String name = server.hasArg("name") ? server.arg("name") : "C4";
+  float beats = server.hasArg("beats") ? server.arg("beats").toFloat() : 1.0f;
+  if (beats <= 0) beats = 0.25f;
+  playNoteBeats(name, beats);
+  handleRoot();
+}
+
+void handleMaryGET() {
+  playMary();
+  handleRoot();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // Attach buzzer to LEDC (Core 3.x: attach by PIN with base freq + resolution)
+  pinMode(BUZZER_PIN, OUTPUT);
+  // Base frequency here is just an initial value; ledcWriteTone will switch per-note
+  ledcAttach(BUZZER_PIN, 2000, PWM_RES);
+
+  // Start SoftAP (default IP 192.168.4.1)
+  WiFi.mode(WIFI_AP);
+  bool ok = WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.printf("AP start: %s\n", ok ? "OK" : "FAILED");
+  Serial.print("SSID: "); Serial.println(AP_SSID);
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+  // Routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/beep", HTTP_GET, handleBeepGET);
+  server.on("/note", HTTP_GET, handleNoteGET);
+  server.on("/mary", HTTP_GET, handleMaryGET);
 
   server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop() {
+  server.handleClient();
 }
