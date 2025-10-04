@@ -1,0 +1,23 @@
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+
+AsyncWebServer server(80);
+
+void setup(){
+  WiFi.begin("SSID","PASS");
+  while(WiFi.status() != WL_CONNECTED) delay(200);
+  server.on("/cmd", HTTP_POST, [](AsyncWebServerRequest *request){
+    // this callback is called after the body is fully received (we use onRequestBody below)
+    request->send(200, "application/json", "{\"status\":\"ok\"}");
+  }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+    // body arrives here
+    StaticJsonDocument<1024> doc;
+    auto err = deserializeJson(doc, (const char*)data, len);
+    if (!err) {
+      handleJsonCommand(doc.as<JsonObject>(), nullptr); // same dispatcher as WS
+    }
+  });
+
+  server.begin();
+}
