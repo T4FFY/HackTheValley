@@ -1,18 +1,19 @@
 // ESP32 (Arduino Core 3.x)
-// SoftAP + Web UI with 3 test buttons:
-//  - Beep once
-//  - Play note (name + beats)
-//  - Mary Had a Little Lamb
+// SoftAP + Buzzer (beep/note/mary) + NeoPixel solid color via POST /rgb
 //
-// Endpoints:
+// Endpoints (existing):
 //   GET /beep
 //   GET /note?name=C4&beats=1
 //   GET /mary
 //
-// Works great with a passive buzzer on GPIO 26 (change BUZZER_PIN if needed).
+// New (this replaces rainbow control):
+//   POST /rgb?r=R&g=G&b=B       (0..255 each)
+//   POST /rgb?hex=%23RRGGBB     (URL-encoded '#RRGGBB')
+//   Body text/plain also allowed: "#RRGGBB" or "r=..&g=..&b=.."
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Adafruit_NeoPixel.h>
 
 // ====== Access Point config ======
 const char* AP_SSID     = "esp32-bot";
@@ -22,29 +23,27 @@ const char* AP_PASSWORD = "hackme123";  // set "" for open AP
 const int   BUZZER_PIN  = 26;     // passive buzzer + -> this pin, - -> GND
 const uint8_t PWM_RES   = 8;      // LEDC resolution bits
 const int   TEMPO_BPM   = 120;    // beats per minute for "beats" math
-// 1 beat in ms:
 const int   BEAT_MS     = 60000 / TEMPO_BPM;
+
+// ====== NeoPixel config ======
+#define NEO_PIN    14       // DIN pin
+#define NEO_COUNT  8       // number of pixels
+#define NEO_BRIGHT 60      // 0..255
+Adafruit_NeoPixel strip(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
 
 // ====== HTTP server ======
 WebServer server(80);
 
-// ---- Simple note table (common notes C3..C6). Add more if you like.
+// ---- Simple note table (common notes C3..C6)
 struct NoteMap { const char* name; uint16_t freq; };
 static const NoteMap NOTES[] = {
-  // C3..B3
-  {"C3", 131}, {"D3", 147}, {"E3", 165}, {"F3", 175}, {"G3", 196}, {"A3", 220}, {"B3", 247},
-  // C4..B4 (middle C = C4)
-  {"C4", 262}, {"D4", 294}, {"E4", 330}, {"F4", 349}, {"G4", 392}, {"A4", 440}, {"B4", 494},
-  // C5..B5
-  {"C5", 523}, {"D5", 587}, {"E5", 659}, {"F5", 698}, {"G5", 784}, {"A5", 880}, {"B5", 988},
-  // C6..G6 (just a few higher)
-  {"C6", 1047}, {"D6", 1175}, {"E6", 1319}, {"F6", 1397}, {"G6", 1568}
+  {"C3",131},{"D3",147},{"E3",165},{"F3",175},{"G3",196},{"A3",220},{"B3",247},
+  {"C4",262},{"D4",294},{"E4",330},{"F4",349},{"G4",392},{"A4",440},{"B4",494},
+  {"C5",523},{"D5",587},{"E5",659},{"F5",698},{"G5",784},{"A5",880},{"B5",988},
+  {"C6",1047},{"D6",1175},{"E6",1319},{"F6",1397},{"G6",1568}
 };
-// Look up frequency (Hz) by note name, returns 0 if not found (treated as rest)
 uint16_t noteFreq(const String& name) {
-  for (auto &n : NOTES) {
-    if (name.equalsIgnoreCase(n.name)) return n.freq;
-  }
+  for (auto &n : NOTES) if (name.equalsIgnoreCase(n.name)) return n.freq;
   return 0;
 }
 
@@ -55,25 +54,15 @@ void toneMs(uint16_t freqHz, uint16_t durationMs) {
   delay(durationMs);
   ledcWriteTone(BUZZER_PIN, 0);
 }
-
-// Beep once: 2 kHz, 500 ms
 void beepOnce() { toneMs(2000, 500); }
-
-// Play one musical note for X beats (blocking)
 void playNoteBeats(const String& name, float beats) {
   uint16_t f = noteFreq(name);
   int dur = max(1, int(beats * BEAT_MS));
-  if (f == 0) {
-    // Treat unknown/REST as short pause
-    delay(dur);
-  } else {
-    toneMs(f, dur);
-  }
+  if (f == 0) delay(dur);
+  else        toneMs(f, dur);
 }
 
-// ---- Mary Had a Little Lamb (in key of C, one-beat notes) ----
-// Melody: E D C D E E E | D D D | E G G | E D C D E E E E | D D E D C
-// Durations: mostly quarter notes (1 beat), a few 2-beat notes
+// ---- Mary Had a Little Lamb ----
 const char* MARY_NOTES[] = {
   "E4","D4","C4","D4","E4","E4","E4",
   "D4","D4","D4","E4","G4","G4",
@@ -87,21 +76,53 @@ const float MARY_BEATS[] = {
   1,1,1,1,2
 };
 const size_t MARY_LEN = sizeof(MARY_BEATS)/sizeof(MARY_BEATS[0]);
-
 void playMary() {
   for (size_t i = 0; i < MARY_LEN; ++i) {
     playNoteBeats(String(MARY_NOTES[i]), MARY_BEATS[i]);
-    // Tiny gap between notes for clarity (10% of a beat)
     delay(int(BEAT_MS * 0.1));
   }
 }
 
-// ---- Simple HTML UI (3 test controls) ----
+// ====== CORS helpers ======
+static inline void addCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+void handleOptions() { addCORS(); server.send(204); }
+
+// ====== NeoPixel color helpers ======
+uint8_t hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  c |= 0x20; // tolower
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  return 0;
+}
+bool parseHexColor(const String& s, uint8_t& r, uint8_t& g, uint8_t& b) {
+  // Accept "#RRGGBB" or "RRGGBB"
+  String t = s;
+  t.trim();
+  if (t.length() == 0) return false;
+  if (t[0] == '#') t.remove(0, 1);
+  if (t.length() != 6) return false;
+  r = (hexNibble(t[0]) << 4) | hexNibble(t[1]);
+  g = (hexNibble(t[2]) << 4) | hexNibble(t[3]);
+  b = (hexNibble(t[4]) << 4) | hexNibble(t[5]);
+  return true;
+}
+void setAllColor(uint8_t r, uint8_t g, uint8_t b) {
+  for (uint16_t i = 0; i < strip.numPixels(); i++) {
+    strip.setPixelColor(i, strip.Color(r, g, b));
+  }
+  strip.show();
+}
+
+// ---- Simple HTML UI (updated hint) ----
 String htmlPage() {
   String ip = WiFi.softAPIP().toString();
   String page =
     "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'/>"
-    "<title>ESP32 Buzzer</title>"
+    "<title>ESP32 Buzzer + RGB</title>"
     "<style>"
     "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f6f7fb;margin:0;padding:24px}"
     ".card{max-width:720px;margin:0 auto;background:#fff;padding:24px 28px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,.08)}"
@@ -114,12 +135,10 @@ String htmlPage() {
     ".hint{color:#777;font-size:14px}"
     "</style></head><body><div class='card'>"
     "<h1>ESP32 Buzzer (AP mode)</h1>"
-    "<p>Connect to Wi-Fi <b>esp32-bot</b> (pwd <code>hackme123</code>). This page is served from <code>http://" + ip + "/</code>.</p>"
+    "<p>Connect to Wi-Fi <b>esp32-bot</b> (pwd <code>hackme123</code>). Served from <code>http://" + ip + "/</code>.</p>"
 
     "<h3>1) Beep Once</h3>"
-    "<div class='row'>"
-      "<form action='/beep' method='get'><button>Beep!</button></form>"
-    "</div>"
+    "<div class='row'><form action='/beep' method='get'><button>Beep!</button></form></div>"
 
     "<h3>2) Play a Note</h3>"
     "<form action='/note' method='get' class='row'>"
@@ -127,14 +146,15 @@ String htmlPage() {
       "<label>Beats&nbsp;<input name='beats' type='number' min='0.1' step='0.1' value='1' required></label>"
       "<button>Play Note</button>"
     "</form>"
-    "<div class='hint'>Supported notes include C3..B5 and a few higher; unknown names act as a rest.</div>"
+    "<div class='hint'>Supported: C3..B5 (+ a few higher). Unknown names are rests.</div>"
 
     "<h3>3) Mary Had a Little Lamb</h3>"
-    "<div class='row'>"
-      "<form action='/mary' method='get'><button>Play Mary</button></form>"
-    "</div>"
+    "<div class='row'><form action='/mary' method='get'><button>Play Mary</button></form></div>"
 
-    "<p class='hint'>API: <code>GET /beep</code>, <code>GET /note?name=C4&beats=1</code>, <code>GET /mary</code></p>"
+    "<h3>4) RGB Solid Color (POST /rgb)</h3>"
+    "<p class='hint'>Set with: <code>POST /rgb?r=255&g=0&b=128</code> or <code>POST /rgb?hex=%23FF0080</code> (or body \"#FF0080\").</p>"
+
+    "<p class='hint'>API: <code>GET /beep</code>, <code>GET /note?name=C4&beats=1</code>, <code>GET /mary</code>, <code>POST /rgb</code></p>"
     "</div></body></html>";
   return page;
 }
@@ -142,32 +162,77 @@ String htmlPage() {
 // ---- Handlers ----
 void handleRoot() { server.send(200, "text/html", htmlPage()); }
 
-void handleBeepGET() {
-  beepOnce();
-  handleRoot();
-}
+void handleBeepGET() { beepOnce(); handleRoot(); }
 
 void handleNoteGET() {
   String name = server.hasArg("name") ? server.arg("name") : "C4";
   float beats = server.hasArg("beats") ? server.arg("beats").toFloat() : 1.0f;
   if (beats <= 0) beats = 0.25f;
-  playNoteBeats(name, beats);
-  handleRoot();
+  playNoteBeats(name, beats); handleRoot();
 }
 
-void handleMaryGET() {
-  playMary();
-  handleRoot();
+void handleMaryGET() { playMary(); handleRoot(); }
+
+// POST /rgb — set solid color on all pixels
+// Query: /rgb?r=R&g=G&b=B   OR   /rgb?hex=%23RRGGBB
+// Body (text/plain) also allowed: "#RRGGBB" or "r=..&g=..&b=.."
+void handleRgbPOST() {
+  addCORS();
+
+  uint8_t r = 0, g = 0, b = 0;
+  bool ok = false;
+
+  // query params first
+  if (server.hasArg("hex")) {
+    ok = parseHexColor(server.arg("hex"), r, g, b);
+  } else if (server.hasArg("r") || server.hasArg("g") || server.hasArg("b")) {
+    r = constrain(server.arg("r").toInt(), 0, 255);
+    g = constrain(server.arg("g").toInt(), 0, 255);
+    b = constrain(server.arg("b").toInt(), 0, 255);
+    ok = true;
+  }
+
+  // if not provided in query, check body
+  if (!ok) {
+    String body = server.arg("plain"); body.trim();
+    if (body.startsWith("#") || body.length() == 6) {
+      ok = parseHexColor(body, r, g, b);
+    } else if (body.length() > 0) {
+      // naive form: r=..&g=..&b=..
+      int ri = body.indexOf("r=");
+      int gi = body.indexOf("g=");
+      int bi = body.indexOf("b=");
+      if (ri >= 0) r = constrain(body.substring(ri+2).toInt(), 0, 255);
+      if (gi >= 0) g = constrain(body.substring(gi+2).toInt(), 0, 255);
+      if (bi >= 0) b = constrain(body.substring(bi+2).toInt(), 0, 255);
+      ok = (ri >= 0 || gi >= 0 || bi >= 0);
+    }
+  }
+
+  if (!ok) {
+    server.send(400, "application/json", "{\"error\":\"provide r,g,b or hex\"}");
+    return;
+  }
+
+  setAllColor(r, g, b);
+  server.send(200, "application/json",
+              String("{\"ok\":true,\"r\":") + r + ",\"g\":" + g + ",\"b\":" + b + "}");
 }
+
+void handleRgbOPTIONS() { handleOptions(); }
 
 void setup() {
   Serial.begin(115200);
   delay(200);
 
-  // Attach buzzer to LEDC (Core 3.x: attach by PIN with base freq + resolution)
+  // Buzzer PWM (Core 3.x)
   pinMode(BUZZER_PIN, OUTPUT);
-  // Base frequency here is just an initial value; ledcWriteTone will switch per-note
   ledcAttach(BUZZER_PIN, 2000, PWM_RES);
+
+  // NeoPixel init
+  strip.begin();
+  strip.setBrightness(NEO_BRIGHT);
+  strip.show(); // all off
 
   // Start SoftAP (default IP 192.168.4.1)
   WiFi.mode(WIFI_AP);
@@ -177,10 +242,13 @@ void setup() {
   Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
 
   // Routes
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/beep", HTTP_GET, handleBeepGET);
-  server.on("/note", HTTP_GET, handleNoteGET);
-  server.on("/mary", HTTP_GET, handleMaryGET);
+  server.on("/",    HTTP_GET,      handleRoot);
+  server.on("/beep",HTTP_GET,      handleBeepGET);
+  server.on("/note",HTTP_GET,      handleNoteGET);
+  server.on("/mary",HTTP_GET,      handleMaryGET);
+
+  server.on("/rgb", HTTP_OPTIONS,  handleRgbOPTIONS);
+  server.on("/rgb", HTTP_POST,     handleRgbPOST);
 
   server.begin();
   Serial.println("HTTP server started");
