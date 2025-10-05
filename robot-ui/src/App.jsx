@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Play, Trash2, Zap, Lightbulb, Bot } from "lucide-react";
+import { Play, Zap, Lightbulb, Bot } from "lucide-react";
 
 const BlocklyRobotController = () => {
   const blocklyDiv = useRef(null);
@@ -466,20 +466,39 @@ const BlocklyRobotController = () => {
     }
   };
 
+  useEffect(() => {
+    if (workspaceRef.current && loaded && window.Blockly) {
+      const updateCode = () => {
+        const jsCode = window.Blockly.JavaScript.workspaceToCode(
+          workspaceRef.current
+        );
+        setCode(jsCode);
+
+        const lines = jsCode.split("\n").filter((l) => l.trim());
+        if (lines.length > 0) {
+          setOutput(
+            "✅ Ready to execute!\n\n" +
+              lines.map((l, i) => `Step ${i + 1}: ${l}`).join("\n")
+          );
+        } else {
+          setOutput("👋 Drag some blocks from the toolbox to get started!");
+        }
+      };
+      
+      workspaceRef.current.addChangeListener(updateCode);
+      
+      return () => {
+        if (workspaceRef.current) {
+          workspaceRef.current.removeChangeListener(updateCode);
+        }
+      };
+    }
+  }, [loaded]);
+
   const runCode = () => {
     setIsRunning(true);
     generateCode();
     setTimeout(() => setIsRunning(false), 1000);
-  };
-
-  const clearWorkspace = () => {
-    if (workspaceRef.current) {
-      if (window.confirm("🤔 Are you sure you want to clear your workspace?")) {
-        workspaceRef.current.clear();
-        setCode("");
-        setOutput("");
-      }
-    }
   };
 
   return (
@@ -621,8 +640,11 @@ const BlocklyRobotController = () => {
                   {isRunning ? "Running..." : "Run!"}
                 </button>
                 <button
-                  onClick={clearWorkspace}
-                  disabled={!loaded}
+                  onClick={() => {
+                    setIsRunning(false);
+                    setOutput("⏹️ Program stopped!");
+                  }}
+                  disabled={!loaded || !isRunning}
                   style={{
                     background: "linear-gradient(to right, #ef4444, #ec4899)",
                     color: "white",
@@ -635,13 +657,13 @@ const BlocklyRobotController = () => {
                     justifyContent: "center",
                     gap: "0.5rem",
                     border: "none",
-                    cursor: loaded ? "pointer" : "not-allowed",
-                    opacity: !loaded ? 0.5 : 1,
+                    cursor: loaded && isRunning ? "pointer" : "not-allowed",
+                    opacity: !loaded || !isRunning ? 0.5 : 1,
                     height: "4rem"
                   }}
                 >
-                  <Trash2 style={{ width: "1.25rem", height: "1.25rem" }} />
-                  Clear
+                  <Zap style={{ width: "1.25rem", height: "1.25rem" }} />
+                  Stop
                 </button>
               </div>
               
@@ -649,7 +671,7 @@ const BlocklyRobotController = () => {
                 background: "linear-gradient(to bottom right, #111827, #581c87)",
                 borderRadius: "1rem",
                 padding: "1.25rem",
-                height: "calc(700px - 4rem - 1.5rem)",
+                height: "calc(700px - 4rem - 1.5rem - 3.5rem)",
                 overflow: "auto",
                 boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.1)",
                 border: "2px solid #a78bfa"
