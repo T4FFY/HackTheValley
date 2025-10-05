@@ -1,10 +1,15 @@
-
 // ESP32 (Arduino Core 3.x)
-// SoftAP + Buzzer (beep/note/mary) + NeoPixel solid color via POST /rgb
+// SoftAP + Buzzer (beep/note/mary) + NeoPixel (/rgb) + Grove RGB LCD (/lcd)
+// Grove LCD is driven with raw I2C (no external LCD libs).
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Adafruit_NeoPixel.h>
+#include <Wire.h>
+
+// ====== CONFIG: LCD init you found working in the sweep ======
+#define LCD_MODE      'A'   // 'A' or 'B' (from the sweep)
+#define LCD_CONTRAST  45    // 25..60 (from the sweep)
 
 // ====== Access Point config ======
 const char* AP_SSID     = "esp32-bot";
@@ -16,11 +21,17 @@ const uint8_t PWM_RES   = 8;      // LEDC resolution bits
 const int   TEMPO_BPM   = 120;
 const int   BEAT_MS     = 60000 / TEMPO_BPM;
 
-// ====== NeoPixel config ======
+// ====== NeoPixel (LED strip) config ======
 #define NEO_PIN    15
 #define NEO_COUNT  8
 #define NEO_BRIGHT 60
 Adafruit_NeoPixel strip(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
+
+// ====== Grove LCD (JHD1313M1) addresses ======
+#define LCD_TEXT_ADDR 0x3E   // text controller
+#define LCD_RGB_ADDR  0x62   // backlight controller
+const int LCD_COLS = 16;
+const int LCD_ROWS = 2;
 
 // ====== HTTP server ======
 WebServer server(80);
@@ -48,7 +59,8 @@ void toneMs(uint16_t freqHz, uint16_t durationMs) {
 void beepOnce() { toneMs(2000, 500); }
 void playNoteBeats(const String& name, float beats) {
   uint16_t f = noteFreq(name);
-  int dur = max(1, int(beats * BEAT_MS));
+  int dur = (int)(beats * BEAT_MS);
+  if (dur < 1) dur = 1;
   if (f == 0) delay(dur);
   else        toneMs(f, dur);
 }
@@ -81,10 +93,10 @@ static inline void addCORS() {
   server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 void handleOptions() { addCORS(); server.send(204); }
-// Missing in your paste — small wrapper so your route compiles:
 void handleRgbOPTIONS() { handleOptions(); }
+void handleLcdOPTIONS() { handleOptions(); }
 
-// ====== NeoPixel color helpers ======
+// ====== Shared helpers (hex color + centering) ======
 uint8_t hexNibble(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   c |= 0x20; // tolower
@@ -92,9 +104,7 @@ uint8_t hexNibble(char c) {
   return 0;
 }
 bool parseHexColor(const String& s, uint8_t& r, uint8_t& g, uint8_t& b) {
-  // Accept "#RRGGBB" or "RRGGBB"
-  String t = s;
-  t.trim();
+  String t = s; t.trim();
   if (t.length() == 0) return false;
   if (t[0] == '#') t.remove(0, 1);
   if (t.length() != 6) return false;
@@ -103,6 +113,16 @@ bool parseHexColor(const String& s, uint8_t& r, uint8_t& g, uint8_t& b) {
   b = (hexNibble(t[4]) << 4) | hexNibble(t[5]);
   return true;
 }
+String centered16(const String& s) {
+  String t = s; t.trim();
+  if ((int)t.length() >= LCD_COLS) return t.substring(0, LCD_COLS);
+  int pad = (LCD_COLS - t.length()) / 2;
+  String left="";  for (int i=0;i<pad;i++) left+=' ';
+  String right=""; for (int i=0;i<(LCD_COLS - pad - t.length()); i++) right+=' ';
+  return left + t + right;
+}
+
+// ====== NeoPixel helpers ======
 void setAllColor(uint8_t r, uint8_t g, uint8_t b) {
   for (uint16_t i = 0; i < strip.numPixels(); i++) {
     strip.setPixelColor(i, strip.Color(r, g, b));
@@ -110,67 +130,133 @@ void setAllColor(uint8_t r, uint8_t g, uint8_t b) {
   strip.show();
 }
 
+// ====== Grove LCD low-level (0x3E/0x62) ======
+void lcdCmd(uint8_t c){
+  Wire.beginTransmission(LCD_TEXT_ADDR);
+  Wire.write(0x80);  // Co=1, RS=0 (command)
+  Wire.write(c);
+  Wire.endTransmission();
+}
+void lcdData(uint8_t d){
+  Wire.beginTransmission(LCD_TEXT_ADDR);
+  Wire.write(0x40);  // Co=0, RS=1 (data)
+  Wire.write(d);
+  Wire.endTransmission();
+}
+void lcdClear(){ lcdCmd(0x01); delay(3); }
+void lcdSetCursor(uint8_t col, uint8_t row){
+  static const uint8_t offs[2] = {0x00, 0x40};
+  lcdCmd(0x80 | (offs[row%2] + (col%16)));
+}
+void lcdPrint(const String& s){ for (size_t i=0;i<s.length();++i) lcdData((uint8_t)s[i]); }
+
+// Init sequence variants:
+//   Mode 'A': 0x54 for high contrast bits
+//   Mode 'B': 0x5C for high contrast bits
+void lcdInitSequence(char mode, uint8_t contrast){
+  // Extended instruction set (IS=1)
+  lcdCmd(0x39);            // IS=1, 2-line
+  lcdCmd(0x14);            // OSC freq adjust
+  lcdCmd(0x70 | (contrast & 0x0F));                // contrast low bits
+  if (mode=='A') lcdCmd(0x54 | ((contrast>>4)&0x03));
+  else            lcdCmd(0x5C | ((contrast>>4)&0x03));
+  lcdCmd(0x6C);            // Follower on
+  delay(250);              // important
+
+  // Normal instruction set
+  lcdCmd(0x38);            // IS=0, 2 lines
+  lcdCmd(0x0C);            // Display ON, cursor OFF
+  lcdClear();
+  lcdCmd(0x06);            // Entry mode: increment
+}
+
+// RGB backlight (0x62)
+void rgbWrite(uint8_t reg, uint8_t val){
+  Wire.beginTransmission(LCD_RGB_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+void lcdSetRGB(uint8_t r, uint8_t g, uint8_t b){
+  rgbWrite(0x00, 0x00);  // MODE1
+  rgbWrite(0x01, 0x00);  // MODE2
+  rgbWrite(0x08, 0xAA);  // LEDOUT: PWM on all channels
+  rgbWrite(0x04, r);     // RED
+  rgbWrite(0x03, g);     // GREEN
+  rgbWrite(0x02, b);     // BLUE
+}
+
 // ---- Simple HTML UI ----
 String htmlPage() {
   String ip = WiFi.softAPIP().toString();
   String page =
     "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'/>"
-    "<title>ESP32 Buzzer + RGB</title>"
+    "<title>ESP32 Buzzer + RGB + LCD</title>"
     "<style>"
     "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f6f7fb;margin:0;padding:24px}"
-    ".card{max-width:720px;margin:0 auto;background:#fff;padding:24px 28px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,.08)}"
+    ".card{max-width:860px;margin:0 auto;background:#fff;padding:24px 28px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,.08)}"
     "h1{margin:0 0 8px 0;font-size:24px}"
-    "p{color:#444}"
-    ".row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 18px}"
+    "p{color:#444}.row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 18px}"
     "input,select{font-size:16px;padding:10px 12px;border:1px solid #ddd;border-radius:10px}"
     "button{font-size:16px;padding:12px 18px;border:none;border-radius:10px;cursor:pointer;background:#4CAF50;color:#fff}"
-    "button:active{transform:translateY(1px)}"
     ".hint{color:#777;font-size:14px}"
     "</style></head><body><div class='card'>"
-    "<h1>ESP32 Buzzer (AP mode)</h1>"
-    "<p>Connect to Wi-Fi <b>esp32-bot</b> (pwd <code>hackme123</code>). Served from <code>http://" + ip + "/</code>.</p>"
+    "<h1>ESP32 (AP) — Buzzer + NeoPixel + Grove LCD</h1>"
+    "<p>Connect to <b>esp32-bot</b> (pwd <code>hackme123</code>) → <code>http://" + ip + "/</code></p>"
 
-    "<h3>1) Beep Once</h3>"
+    "<h3>1) Beep</h3>"
     "<div class='row'><form action='/beep' method='get'><button>Beep!</button></form></div>"
 
     "<h3>2) Play a Note</h3>"
     "<form action='/note' method='get' class='row'>"
-      "<label>Note&nbsp;<input name='name' placeholder='e.g., C4, E4, G5' required></label>"
+      "<label>Note&nbsp;<input name='name' value='C4' required></label>"
       "<label>Beats&nbsp;<input name='beats' type='number' min='0.1' step='0.1' value='1' required></label>"
-      "<button>Play Note</button>"
+      "<button>Play</button>"
     "</form>"
-    "<div class='hint'>Supported: C3..B5 (+ a few higher). Unknown names are rests.</div>"
 
     "<h3>3) Mary Had a Little Lamb</h3>"
     "<div class='row'><form action='/mary' method='get'><button>Play Mary</button></form></div>"
 
-    "<h3>4) RGB Solid Color (POST /rgb)</h3>"
+    "<h3>4) NeoPixel RGB (POST /rgb)</h3>"
     "<p class='hint'>Set with: <code>POST /rgb?r=255&g=0&b=128</code> or <code>POST /rgb?hex=%23FF0080</code> (or body \"#FF0080\").</p>"
 
-    "<p class='hint'>API: <code>GET /beep</code>, <code>GET /note?name=C4&beats=1</code>, <code>GET /mary</code>, <code>POST /rgb</code></p>"
+    "<h3>5) Grove LCD (GET/POST /lcd)</h3>"
+    "<p class='hint'>Params: <code>msg=...</code> (required). Optional backlight <code>r,g,b</code> or <code>hex=%23RRGGBB</code>. Optional <code>row</code> and <code>align</code>.</p>"
+    "<form action='/lcd' method='post' class='row'>"
+      "<label>Text&nbsp;<input name='msg' placeholder='Hello, Grove LCD!' required></label>"
+      "<label>Row&nbsp;<input name='row' type='number' min='0' max='1' value='0'></label>"
+      "<label>Align&nbsp;<select name='align'><option>center</option><option>left</option><option>right</option></select></label>"
+      "<label>Hex&nbsp;<input name='hex' placeholder='#00AEEF'></label>"
+      "<button>Show</button>"
+    "</form>"
+
+    "<p class='hint'>I2C: SDA=21, SCL=22. LCD text=0x3E, RGB=0x62. NeoPixel on GPIO 15.</p>"
     "</div></body></html>";
   return page;
 }
 
-// ---- Handlers ----
+// ---- Web Handlers ----
 void handleRoot() { server.send(200, "text/html", htmlPage()); }
+
 void handleBeepGET() { beepOnce(); handleRoot(); }
+
 void handleNoteGET() {
   String name = server.hasArg("name") ? server.arg("name") : "C4";
   float beats = server.hasArg("beats") ? server.arg("beats").toFloat() : 1.0f;
   if (beats <= 0) beats = 0.25f;
   playNoteBeats(name, beats); handleRoot();
 }
+
 void handleMaryGET() { playMary(); handleRoot(); }
 
-// --- RGB unified handler: supports GET and POST, returns HTML like the buzzer routes
+// --- /rgb: GET/POST unified handler (NeoPixel strip) ---
 void handleRgbAny() {
   addCORS();
 
   uint8_t r = 0, g = 0, b = 0;
   bool ok = false;
 
-  // 1) Query string first (works for GET or POST with ?r=..)
+  // Query string first
   if (server.hasArg("hex")) {
     ok = parseHexColor(server.arg("hex"), r, g, b);
   } else if (server.hasArg("r") || server.hasArg("g") || server.hasArg("b")) {
@@ -180,7 +266,7 @@ void handleRgbAny() {
     ok = true;
   }
 
-  // 2) If not provided in query, parse POST body
+  // Body fallbacks
   if (!ok && server.method() == HTTP_POST) {
     String ct = server.header("Content-Type");
     ct.toLowerCase();
@@ -245,10 +331,63 @@ void handleRgbAny() {
 
   setAllColor(r, g, b);
   Serial.printf("RGB set to (%u,%u,%u)\n", r, g, b);
-
-  // mirror buzzer routes: return the main page
   server.send(200, "text/html", htmlPage());
-} // <<< you were missing this brace
+}
+
+// --- /lcd: GET/POST unified handler (Grove LCD) ---
+void handleLcdAny() {
+  addCORS();
+
+  String msg; bool ok=false;
+  int row = 0;
+  String align = "center";
+  uint8_t cr=0, cg=128, cb=255; // default cyan-ish
+  bool hasColor = false;
+
+  // Query/form args
+  if (server.hasArg("msg")) { msg = server.arg("msg"); ok = true; }
+  if (server.hasArg("row")) row = constrain(server.arg("row").toInt(), 0, 1);
+  if (server.hasArg("align")) { String a = server.arg("align"); a.toLowerCase(); if (a=="left"||a=="right"||a=="center") align = a; }
+  if (server.hasArg("hex")) { hasColor = parseHexColor(server.arg("hex"), cr,cg,cb); }
+  if (!hasColor && (server.hasArg("r")||server.hasArg("g")||server.hasArg("b"))) {
+    cr = constrain(server.arg("r").toInt(),0,255);
+    cg = constrain(server.arg("g").toInt(),0,255);
+    cb = constrain(server.arg("b").toInt(),0,255);
+    hasColor = true;
+  }
+
+  // text/plain fallback
+  if (!ok && server.method()==HTTP_POST) {
+    String body = server.arg("plain"); body.trim();
+    if (body.length()>0) { msg = body; ok = true; }
+  }
+
+  if (!ok) { server.send(400, "application/json", "{\"error\":\"invalid params\"}"); return; }
+
+  if (hasColor) lcdSetRGB(cr,cg,cb);
+
+  // Render text
+  if (msg.indexOf('\n') >= 0) {
+    String l1 = msg.substring(0, msg.indexOf('\n'));
+    String l2 = msg.substring(msg.indexOf('\n') + 1);
+    lcdClear();
+    lcdSetCursor(0,0); lcdPrint(centered16(l1));
+    lcdSetCursor(0,1); lcdPrint(centered16(l2));
+  } else {
+    if (align == "center") {
+      lcdClear();
+      lcdSetCursor(0,row); lcdPrint(centered16(msg));
+    } else {
+      String t = msg; t.trim(); if ((int)t.length() > LCD_COLS) t = t.substring(0, LCD_COLS);
+      int col = (align=="right") ? (LCD_COLS - t.length()) : 0;
+      // clear the row then print
+      lcdSetCursor(0,row); for (int i=0;i<LCD_COLS;i++) lcdData(' ');
+      lcdSetCursor(col,row); lcdPrint(t);
+    }
+  }
+
+  server.send(200, "text/html", htmlPage());
+}
 
 void setup() {
   Serial.begin(115200);
@@ -263,6 +402,17 @@ void setup() {
   strip.setBrightness(NEO_BRIGHT);
   strip.show(); // all off
 
+  // I2C init (standard ESP32 pins)
+  Wire.begin(21, 22);
+  Wire.setClock(100000);
+
+  // Grove LCD init (use the working mode/contrast you found)
+  lcdInitSequence(LCD_MODE, LCD_CONTRAST);
+  lcdSetRGB(0, 128, 255); // cyan splash
+  lcdClear();
+  lcdSetCursor(0,0); lcdPrint(centered16("Grove RGB LCD"));
+  lcdSetCursor(0,1); lcdPrint(centered16("AP ready"));
+
   // Start SoftAP (default IP 192.168.4.1)
   WiFi.mode(WIFI_AP);
   bool ok = WiFi.softAP(AP_SSID, AP_PASSWORD);
@@ -271,13 +421,16 @@ void setup() {
   Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
 
   // Routes
-  server.on("/",    HTTP_GET,      handleRoot);
-  server.on("/beep",HTTP_GET,      handleBeepGET);
-  server.on("/note",HTTP_GET,      handleNoteGET);
-  server.on("/mary",HTTP_GET,      handleMaryGET);
+  server.on("/",     HTTP_GET,      handleRoot);
+  server.on("/beep", HTTP_GET,      handleBeepGET);
+  server.on("/note", HTTP_GET,      handleNoteGET);
+  server.on("/mary", HTTP_GET,      handleMaryGET);
 
-  server.on("/rgb", HTTP_OPTIONS,  handleRgbOPTIONS);
-  server.on("/rgb", HTTP_ANY,      handleRgbAny);   // accept GET and POST
+  server.on("/rgb",  HTTP_OPTIONS,  handleRgbOPTIONS);
+  server.on("/rgb",  HTTP_ANY,      handleRgbAny);   // GET + POST
+
+  server.on("/lcd",  HTTP_OPTIONS,  handleLcdOPTIONS);
+  server.on("/lcd",  HTTP_ANY,      handleLcdAny);   // GET + POST
 
   server.begin();
   Serial.println("HTTP server started");
