@@ -62,6 +62,16 @@ export default function SimpleDragAndRun() {
       case "move":
         add({ id: newId(), type: "move", dir: "forward", seconds: 0.8 });
         break;
+      case "turn":
+        add({
+          id: newId(),
+          type: "turn",
+          dir: "left",
+          mode: "spin",
+          ms: 600,
+          spd: 200,
+        });
+        break;
       case "beep":
         add({ id: newId(), type: "beep" });
         break;
@@ -153,6 +163,19 @@ export default function SimpleDragAndRun() {
               headers: { "Content-Type": "application/x-www-form-urlencoded" },
               body,
             });
+            break;
+          }
+          case "turn": {
+            const dir = (it.dir || "left").toLowerCase();
+            const mode = (it.mode || "spin").toLowerCase();
+            const ms = Math.max(0, Number(it.ms || 600));
+            const spd = Math.max(0, Math.min(255, Number(it.spd || 200)));
+
+            const url = `${base}/turn?dir=${encodeURIComponent(
+              dir
+            )}&mode=${encodeURIComponent(mode)}&ms=${ms}&spd=${spd}`;
+            stepLog(`GET ${url}`);
+            await fetch(url);
             break;
           }
 
@@ -284,6 +307,7 @@ export default function SimpleDragAndRun() {
   const palette = useMemo(
     () => [
       { type: "move", label: "🚗 Move" }, // NEW
+      { type: "turn", label: "↪️ Turn" },
       { type: "beep", label: "🔔 Beep" },
       { type: "note", label: "🎵 Note" },
       { type: "mary", label: "🎶 Mary" },
@@ -638,6 +662,70 @@ export default function SimpleDragAndRun() {
                               updateItem(it.id, { seconds: e.target.value })
                             }
                             style={{ width: 80, marginLeft: 6 }}
+                          />
+                        </label>
+                      </div>
+                    )}
+                    {it.type === "turn" && (
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: 8,
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <strong>↪️ Turn</strong>
+                        <label>
+                          dir:
+                          <select
+                            value={it.dir}
+                            onChange={(e) =>
+                              updateItem(it.id, { dir: e.target.value })
+                            }
+                            style={{ marginLeft: 6 }}
+                          >
+                            <option value="left">left</option>
+                            <option value="right">right</option>
+                          </select>
+                        </label>
+                        <label>
+                          mode:
+                          <select
+                            value={it.mode}
+                            onChange={(e) =>
+                              updateItem(it.id, { mode: e.target.value })
+                            }
+                            style={{ marginLeft: 6 }}
+                          >
+                            <option value="spin">spin</option>
+                            <option value="arc">arc</option>
+                          </select>
+                        </label>
+                        <label>
+                          ms:
+                          <input
+                            type="number"
+                            min="0"
+                            step="50"
+                            value={it.ms}
+                            onChange={(e) =>
+                              updateItem(it.id, { ms: e.target.value })
+                            }
+                            style={{ width: 90, marginLeft: 6 }}
+                          />
+                        </label>
+                        <label>
+                          spd:
+                          <input
+                            type="number"
+                            min="0"
+                            max="255"
+                            value={it.spd}
+                            onChange={(e) =>
+                              updateItem(it.id, { spd: e.target.value })
+                            }
+                            style={{ width: 90, marginLeft: 6 }}
                           />
                         </label>
                       </div>

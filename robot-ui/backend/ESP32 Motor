@@ -1,647 +1,517 @@
-import React, { useCallback, useMemo, useRef, useState } from "react";
+// ESP32 (Arduino Core 3.x)
+// SoftAP + Buzzer + NeoPixel (/rgb) + Grove RGB LCD (/lcd) + Simple Motor (/motor)
 
-/* ------------------------ Config ------------------------ */
-const DEFAULT_ROBOT_URL = "http://192.168.4.1";
-const GAP_MS = 150;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_NeoPixel.h>
+#include <Wire.h>
 
-const NOTE_OPTIONS = [
-  "C3","D3","E3","F3","G3","A3","B3",
-  "C4","D4","E4","F4","G4","A4","B4",
-  "C5","D5","E5","F5","G5","A5","B5",
-  "C6","D6","E6","F6","G6",
-];
+// ====== LCD init that matched your working sweep ======
+#define LCD_MODE      'A'     // 'A' or 'B'
+#define LCD_CONTRAST  45      // 25..60
 
-const COLORS = {
-  motion:  "#4CAF50",
-  sound:   "#E91E63",
-  display: "#FF9800",
-  control: "#673AB7",
-  fx:      "#06B6D4",
+// ====== Access Point ======
+const char* AP_SSID     = "esp32-bot";
+const char* AP_PASSWORD = "hackme123";
+
+// ====== Buzzer ======
+const int   BUZZER_PIN  = 17;
+const uint8_t PWM_RES_BUZ = 12;   // 12-bit (0..4095) for buzzer
+const int   TEMPO_BPM    = 120;
+const int   BEAT_MS      = 60000 / TEMPO_BPM;
+const int   BUZ_BASE_HZ  = 2000;  // initial buzzer freq
+
+// ====== NeoPixel ======
+#define NEO_PIN    15
+#define NEO_COUNT  8
+#define NEO_BRIGHT 60
+Adafruit_NeoPixel strip(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
+
+// ====== Rainbow FX state ======
+volatile bool     FX_RAINBOW_ACTIVE = false;
+volatile uint32_t FX_RAINBOW_INTERVAL_MS = 40; // smaller = faster
+volatile uint8_t  FX_RAINBOW_SAT = 255;        // 0..255
+volatile uint8_t  FX_RAINBOW_VAL = 160;        // brightness (value) 0..255
+volatile uint16_t FX_RAINBOW_HUE_OFF = 0;      // rotating offset
+volatile uint32_t FX_RAINBOW_NEXT_MS = 0;
+
+
+// ====== Grove LCD I2C addrs ======
+#define LCD_TEXT_ADDR 0x3E
+#define LCD_RGB_ADDR  0x62
+const int LCD_COLS = 16;
+const int LCD_ROWS = 2;
+
+// ====== Motor driver (TB6612FNG) ======
+#define AIN1 13
+#define AIN2 14
+#define PWMA 32   // LEFT PWM
+
+#define BIN1 27
+#define BIN2 4    // avoid 12/16 on some ESP32 variants
+#define PWMB 25   // RIGHT PWM
+
+#define STBY 33   // HIGH = enable
+
+static const int MOT_PWM_FREQ = 18000; // 18 kHz
+static const int MOT_PWM_RES  = 8;     // 0..255
+int OFFSET_L = +1;
+int OFFSET_R = +1;
+
+// ====== HTTP server ======
+WebServer server(80);
+
+// ====== Helpers ======
+static inline uint32_t nonneg_ms(long v) { return (v < 0) ? 0u : (uint32_t)v; }
+
+static inline void addCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+void handleOptions() { addCORS(); server.send(204); }
+
+// ---------- Notes & Buzzer ----------
+struct NoteMap { const char* name; uint16_t freq; };
+static const NoteMap NOTES[] = {
+  {"C3",131},{"D3",147},{"E3",165},{"F3",175},{"G3",196},{"A3",220},{"B3",247},
+  {"C4",262},{"D4",294},{"E4",330},{"F4",349},{"G4",392},{"A4",440},{"B4",494},
+  {"C5",523},{"D5",587},{"E5",659},{"F5",698},{"G5",784},{"A5",880},{"B5",988},
+  {"C6",1047},{"D6",1175},{"E6",1319},{"F6",1397},{"G6",1568}
 };
-
-let uid = 1;
-const newId = () => String(uid++);
-
-/* ------------------------ Helpers ------------------------ */
-function clamp255(v) {
-  const n = Math.round(Number(v || 0));
-  if (Number.isNaN(n)) return 0;
-  return Math.min(255, Math.max(0, n));
+uint16_t noteFreq(const String& name) {
+  for (auto &n : NOTES) if (name.equalsIgnoreCase(n.name)) return n.freq;
+  return 0;
 }
-
-/* A little block shell */
-function BlockShell({ color, title, children, onUp, onDown, onDelete }) {
-  return (
-    <div style={{
-      display: "grid",
-      gridTemplateColumns: "12px 1fr auto",
-      gap: 10,
-      padding: 10,
-      borderRadius: 12,
-      background: "#fff",
-      boxShadow: "0 8px 14px rgba(17,24,39,.08)",
-      border: "1px solid rgba(0,0,0,.06)",
-    }}>
-      <div style={{
-        background: color,
-        borderRadius: 999,
-        margin: "6px 0",
-      }} />
-      <div style={{minWidth: 0}}>
-        <div style={{fontWeight: 800, color, marginBottom: 8}}>{title}</div>
-        <div style={{display: "flex", gap: 10, flexWrap: "wrap"}}>{children}</div>
-      </div>
-      <div style={{display: "grid", gap: 6}}>
-        <button onClick={onUp}    title="Move up"   style={btnIcon}>↑</button>
-        <button onClick={onDown}  title="Move down" style={btnIcon}>↓</button>
-        <button onClick={onDelete}title="Delete"    style={{...btnIcon, color:"#ef4444"}}>✕</button>
-      </div>
-    </div>
-  );
+void toneMs(uint16_t freqHz, uint16_t durationMs) {
+  if (freqHz == 0 || durationMs == 0) return;
+  // Only reprogram the buzzer's own channel/timer
+  ledcChangeFrequency(BUZZER_PIN, freqHz, PWM_RES_BUZ);
+  // ~50% duty for a clear tone (half of 12-bit range)
+  ledcWrite(BUZZER_PIN, 2048);
+  delay(durationMs);
+  ledcWrite(BUZZER_PIN, 0);  // silence, keep channel allocated
 }
-
-const btnIcon = {
-  background: "transparent",
-  border: "1px solid #e5e7eb",
-  borderRadius: 10,
-  padding: "6px 8px",
-  cursor: "pointer",
-  fontWeight: 700,
+void beepOnce(){ toneMs(2000,500); }
+void playNoteBeats(const String& name, float beats){
+  uint16_t f=noteFreq(name); int dur=(int)(beats*BEAT_MS); if(dur<1)dur=1;
+  if(f==0) delay(dur); else toneMs(f,dur);
+}
+const char* MARY_NOTES[] = {
+  "E4","D4","C4","D4","E4","E4","E4",
+  "D4","D4","D4","E4","G4","G4",
+  "E4","D4","C4","D4","E4","E4","E4","E4",
+  "D4","D4","E4","D4","C4"
 };
+const float MARY_BEATS[] = {
+  1,1,1,1,1,1,2,
+  1,1,2,1,1,2,
+  1,1,1,1,1,1,1,1,
+  1,1,1,1,2
+};
+const size_t MARY_LEN = sizeof(MARY_BEATS)/sizeof(MARY_BEATS[0]);
+void playMary(){ for(size_t i=0;i<MARY_LEN;++i){ playNoteBeats(String(MARY_NOTES[i]), MARY_BEATS[i]); delay(BEAT_MS/10); } }
 
-/* Palette item styled like a mini block */
-function PaletteItem({ label, color, onDragStart }) {
-  return (
-    <div
-      draggable
-      onDragStart={onDragStart}
-      style={{
-        userSelect: "none",
-        padding: "12px 14px",
-        borderRadius: 12,
-        background: "#fff",
-        border: "1px solid rgba(0,0,0,.06)",
-        boxShadow: "0 6px 12px rgba(17,24,39,.06)",
-        cursor: "grab",
-        display: "grid",
-        gridTemplateColumns: "10px 1fr",
-        gap: 10,
-        alignItems: "center",
-      }}
-    >
-      <div style={{ background: color, height: 16, borderRadius: 999 }} />
-      <div style={{ fontWeight: 700 }}>{label}</div>
-    </div>
-  );
+// ---------- Color helpers ----------
+uint8_t hexNibble(char c){ if(c>='0'&&c<='9')return c-'0'; c|=0x20; if(c>='a'&&c<='f')return 10+(c-'a'); return 0; }
+bool parseHexColor(const String& s,uint8_t& r,uint8_t& g,uint8_t& b){
+  String t=s; t.trim(); if(t.length()==0) return false; if(t[0]=='#') t.remove(0,1); if(t.length()!=6) return false;
+  r=(hexNibble(t[0])<<4)|hexNibble(t[1]); g=(hexNibble(t[2])<<4)|hexNibble(t[3]); b=(hexNibble(t[4])<<4)|hexNibble(t[5]); return true;
+}
+void setAllColor(uint8_t r,uint8_t g,uint8_t b){
+  for(uint16_t i=0;i<strip.numPixels();i++) strip.setPixelColor(i, strip.Color(r,g,b));
+  strip.show();
 }
 
-/* Soft panel shell */
-function Panel({ title, subtitle, children }) {
-  return (
-    <div style={{
-      background: "linear-gradient(180deg, #f9fafb 0%, #ffffff 100%)",
-      border: "1px solid rgba(0,0,0,.06)",
-      borderRadius: 16,
-      boxShadow: "0 10px 20px rgba(17,24,39,.06)",
-      padding: 16
-    }}>
-      <div style={{fontWeight: 900, fontSize: 16}}>{title}</div>
-      {subtitle && <div style={{opacity:.7, marginTop: 4, fontSize: 13}}>{subtitle}</div>}
-      <div style={{marginTop: 12}}>{children}</div>
-    </div>
-  );
+// Uses strip.ColorHSV + gamma correction for smoothness.
+void rainbowStep() {
+  const uint16_t n = strip.numPixels();
+  for (uint16_t i = 0; i < n; i++) {
+    // Spread a full rainbow (0..65535 hue) around the ring, then rotate by hue offset
+    uint16_t hue = (uint16_t)((uint32_t)i * 65535UL / n);
+    hue = hue + (uint16_t)(FX_RAINBOW_HUE_OFF * 256U);  // 1 unit = ~1/256 turn
+    uint32_t c = strip.ColorHSV(hue, FX_RAINBOW_SAT, FX_RAINBOW_VAL);
+    c = strip.gamma32(c); // perceptual brightness
+    strip.setPixelColor(i, c);
+  }
+  strip.show();
+  FX_RAINBOW_HUE_OFF++;  // rotate slowly each step
 }
 
-/* ------------------------ Main ------------------------ */
-export default function SimpleDragAndRunPrettier() {
-  const [robotUrl, setRobotUrl] = useState(DEFAULT_ROBOT_URL);
-  const [items, setItems] = useState([]);
-  const [running, setRunning] = useState(false);
-  const [log, setLog] = useState("👋 Drag actions into the sequence, tweak values, then press Run.");
 
-  // ----- Drag from palette -----
-  const paletteDragStart = (e, type) => e.dataTransfer.setData("text/plain", type);
-
-  const dropZoneRef = useRef(null);
-  const onDragOver = (e) => e.preventDefault();
-  const onDrop = (e) => {
-    e.preventDefault();
-    const type = e.dataTransfer.getData("text/plain");
-    if (!type) return;
-    const add = (obj) => setItems((prev) => [...prev, obj]);
-
-    switch (type) {
-      case "move":
-        add({ id: newId(), type: "move", dir: "forward", seconds: 0.8 });
-        break;
-      case "beep":
-        add({ id: newId(), type: "beep" });
-        break;
-      case "note":
-        add({ id: newId(), type: "note", name: "C4", beats: 1 });
-        break;
-      case "mary":
-        add({ id: newId(), type: "mary" });
-        break;
-      case "rgb":
-        add({ id: newId(), type: "rgb", hex: "#00AEEF", r: 0, g: 128, b: 255 });
-        break;
-      case "lcd":
-        add({
-          id: newId(),
-          type: "lcd",
-          msg: "Hello Robot!",
-          row: 0,
-          align: "center",
-          hex: "#00AEEF",
-          r: 0, g: 128, b: 255,
-        });
-        break;
-      case "wait":
-        add({ id: newId(), type: "wait", seconds: 1 });
-        break;
-      case "rainbowStart":
-        add({ id: newId(), type: "rainbowStart", interval: 40, sat: 255, val: 160 });
-        break;
-      case "rainbowStop":
-        add({ id: newId(), type: "rainbowStop" });
-        break;
-      default:
-        break;
-    }
-  };
-
-  // ----- Update / reorder -----
-  const updateItem = (id, patch) =>
-    setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
-  const removeItem = (id) => setItems((prev) => prev.filter((it) => it.id !== id));
-  const moveUp = (i) => setItems((prev) => (i <= 0 ? prev : swap(prev, i, i - 1)));
-  const moveDown = (i) => setItems((prev) => (i >= prev.length - 1 ? prev : swap(prev, i, i + 1)));
-  const swap = (arr, i, j) => { const c=[...arr]; [c[i],c[j]]=[c[j],c[i]]; return c; };
-
-  // ----- Runner -----
-  const run = useCallback(async () => {
-    if (!items.length || running) return;
-    setRunning(true);
-    setLog("🚀 Executing…");
-
-    const base = robotUrl.replace(/\/+$/, "");
-    const stepLog = (t) => setLog((p) => p + "\n• " + t);
-
-    try {
-      for (const it of items) {
-        switch (it.type) {
-          case "move": {
-            const dir = (it.dir === "backward") ? "back" : "fwd";
-            const ms = Math.max(0, Math.round(Number(it.seconds || 0.8) * 1000));
-            const body = new URLSearchParams({ l: dir, r: dir, ms: String(ms) });
-            stepLog(`POST ${base}/motor  body: ${body.toString()}`);
-            await fetch(`${base}/motor`, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
-            break;
-          }
-          case "beep": {
-            const url = `${base}/beep`;
-            stepLog(`GET ${url}`);
-            await fetch(url);
-            break;
-          }
-          case "note": {
-            const name = it.name || "C4";
-            const beats = Math.max(0.1, Number(it.beats) || 1);
-            const url = `${base}/note?name=${encodeURIComponent(name)}&beats=${encodeURIComponent(beats)}`;
-            stepLog(`GET ${url}`);
-            await fetch(url);
-            break;
-          }
-          case "mary": {
-            const url = `${base}/mary`;
-            stepLog(`GET ${url}`);
-            await fetch(url);
-            break;
-          }
-          case "rgb": {
-            const hasHex = it.hex && String(it.hex).trim().length >= 4;
-            if (hasHex) {
-              let hex = String(it.hex).trim();
-              if (!hex.startsWith("#")) hex = "#" + hex;
-              const body = new URLSearchParams({ hex });
-              stepLog(`POST ${base}/rgb  body: ${body.toString()}`);
-              await fetch(`${base}/rgb`, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
-            } else {
-              const r = clamp255(it.r), g = clamp255(it.g), b = clamp255(it.b);
-              const body = new URLSearchParams({ r: String(r), g: String(g), b: String(b) });
-              stepLog(`POST ${base}/rgb  body: ${body.toString()}`);
-              await fetch(`${base}/rgb`, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
-            }
-            break;
-          }
-          case "lcd": {
-            const p = new URLSearchParams();
-            p.set("msg", it.msg || "");
-            p.set("row", String(Math.min(1, Math.max(0, Number(it.row) || 0))));
-            p.set("align", (it.align || "center").toLowerCase());
-            const hasHex = it.hex && String(it.hex).trim().length >= 4;
-            if (hasHex) {
-              let hex = String(it.hex).trim();
-              if (!hex.startsWith("#")) hex = "#" + hex;
-              p.set("hex", hex);
-            } else if (it.r !== undefined || it.g !== undefined || it.b !== undefined) {
-              p.set("r", String(clamp255(it.r)));
-              p.set("g", String(clamp255(it.g)));
-              p.set("b", String(clamp255(it.b)));
-            }
-            stepLog(`POST ${base}/lcd  body: ${p.toString()}`);
-            await fetch(`${base}/lcd`, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: p });
-            break;
-          }
-          case "wait": {
-            const ms = Math.max(0, Math.round(Number(it.seconds || 1) * 1000));
-            stepLog(`WAIT ${ms}ms`);
-            await sleep(ms);
-            break;
-          }
-          case "rainbowStart": {
-            const interval = Math.max(5, Math.min(1000, Number(it.interval) || 40));
-            const sat = clamp255(it.sat);
-            const val = clamp255(it.val);
-            const url = `${base}/fx/rainbow/start?interval=${encodeURIComponent(interval)}&sat=${encodeURIComponent(sat)}&val=${encodeURIComponent(val)}`;
-            stepLog(`GET ${url}`);
-            await fetch(url);
-            break;
-          }
-          case "rainbowStop": {
-            const url = `${base}/fx/rainbow/stop`;
-            stepLog(`GET ${url}`);
-            await fetch(url);
-            break;
-          }
-          default:
-            break;
-        }
-        await sleep(GAP_MS);
-      }
-      stepLog("✅ Done!");
-    } catch (e) {
-      console.error(e);
-      stepLog(`❌ Error: ${e.message || e}`);
-    } finally {
-      setRunning(false);
-    }
-  }, [items, robotUrl, running]);
-
-  /* ------------------------ UI ------------------------ */
-  const palette = useMemo(
-    () => [
-      { type: "move",         label: "🚗 Move",                color: COLORS.motion },
-      { type: "beep",         label: "🔔 Beep",                color: COLORS.sound  },
-      { type: "note",         label: "🎵 Note",                color: COLORS.sound  },
-      { type: "mary",         label: "🎶 Mary",                color: COLORS.sound  },
-      { type: "rgb",          label: "💡 RGB",                 color: COLORS.display},
-      { type: "lcd",          label: "📺 LCD",                 color: COLORS.display},
-      { type: "wait",         label: "⏱️ Wait",                color: COLORS.control},
-      { type: "rainbowStart", label: "🌈 Rainbow Start",       color: COLORS.fx     },
-      { type: "rainbowStop",  label: "🛑 Rainbow Stop",        color: COLORS.fx     },
-    ],
-    []
-  );
-
-  return (
-    <div style={{ minHeight: "100vh", background: "linear-gradient(135deg,#eef2ff 0%,#fdf2f8 100%)", padding: 18 }}>
-      {/* Header */}
-      <div style={{
-        maxWidth: 1200, margin: "0 auto 14px",
-        display: "flex", alignItems: "center", justifyContent: "space-between",
-      }}>
-        <div>
-          <div style={{fontSize: 28, fontWeight: 900}}>Block-style Robot Runner</div>
-          <div style={{opacity:.7, marginTop: 4}}>
-            /motor, /beep, /note, /mary, /rgb, /lcd, /fx/rainbow/*
-          </div>
-        </div>
-        <div style={{display: "flex", gap: 10, alignItems: "center"}}>
-          <span style={{fontWeight: 700}}>Robot URL:</span>
-          <input
-            value={robotUrl}
-            onChange={(e) => setRobotUrl(e.target.value)}
-            placeholder="http://192.168.4.1"
-            style={{
-              width: 320, padding: "10px 12px", borderRadius: 12,
-              border: "1px solid #e5e7eb", boxShadow: "0 2px 8px rgba(17,24,39,.05)"
-            }}
-          />
-        </div>
-      </div>
-
-      {/* Grid */}
-      <div style={{
-        maxWidth: 1200, margin: "0 auto",
-        display: "grid", gridTemplateColumns: "260px 1fr 360px", gap: 16
-      }}>
-        {/* Palette */}
-        <Panel title="Palette" subtitle="Drag a block into the sequence">
-          <div style={{display: "grid", gap: 10}}>
-            {palette.map((p) => (
-              <PaletteItem
-                key={p.type}
-                label={p.label}
-                color={p.color}
-                onDragStart={(e) => paletteDragStart(e, p.type)}
-              />
-            ))}
-          </div>
-        </Panel>
-
-        {/* Sequence */}
-        <Panel title="Sequence" subtitle="Drop blocks here and tweak values">
-          <div
-            ref={dropZoneRef}
-            onDragOver={onDragOver}
-            onDrop={onDrop}
-            style={{
-              minHeight: 260,
-              padding: 10,
-              border: "2px dashed rgba(0,0,0,.12)",
-              borderRadius: 14,
-              background: "rgba(255,255,255,.6)",
-              boxShadow: "inset 0 2px 10px rgba(17,24,39,.05)",
-            }}
-          >
-            {items.length === 0 ? (
-              <div style={{ color: "#6b7280", padding: 10 }}>
-                Drag blocks here…
-              </div>
-            ) : (
-              <div style={{display:"grid", gap: 10}}>
-                {items.map((it, i) => (
-                  <SequenceBlock
-                    key={it.id}
-                    it={it}
-                    index={i}
-                    updateItem={updateItem}
-                    moveUp={() => moveUp(i)}
-                    moveDown={() => moveDown(i)}
-                    remove={() => removeItem(it.id)}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* Controls */}
-          <div style={{display:"flex", gap:10, marginTop: 12}}>
-            <button
-              onClick={() => setItems([])}
-              disabled={running}
-              style={{
-                padding: "10px 14px",
-                borderRadius: 12,
-                border: "1px solid #e5e7eb",
-                background: "#fff",
-                cursor: running ? "not-allowed" : "pointer",
-              }}
-            >
-              Clear
-            </button>
-            <button
-              onClick={run}
-              disabled={!items.length || running}
-              style={{
-                padding: "10px 16px",
-                borderRadius: 12,
-                border: "0",
-                background: "linear-gradient(90deg,#22c55e,#10b981)",
-                color: "#fff",
-                fontWeight: 900,
-                cursor: !items.length || running ? "not-allowed" : "pointer",
-                boxShadow: "0 10px 18px rgba(16,185,129,.25)",
-                opacity: !items.length || running ? 0.6 : 1,
-              }}
-            >
-              {running ? "Running…" : "Run"}
-            </button>
-          </div>
-        </Panel>
-
-        {/* Log */}
-        <Panel title="Log" subtitle="Requests, waits, and results">
-          <div style={{
-            minHeight: 260,
-            background: "#0f172a",
-            color: "#c7d2fe",
-            borderRadius: 12,
-            padding: 12,
-            whiteSpace: "pre-wrap",
-            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas",
-            fontSize: 13,
-            boxShadow: "inset 0 2px 10px rgba(0,0,0,.3)"
-          }}>
-            {log}
-          </div>
-        </Panel>
-      </div>
-    </div>
-  );
+// ---------- LCD helpers ----------
+String centered16(const String& s){
+  String t=s; t.trim(); if((int)t.length()>=LCD_COLS) return t.substring(0,LCD_COLS);
+  int pad=(LCD_COLS - t.length())/2; String left="", right="";
+  for(int i=0;i<pad;i++) left+=' ';
+  for(int i=0;i<(LCD_COLS-pad-t.length());i++) right+=' ';
+  return left+t+right;
+}
+void lcdCmd(uint8_t c){ Wire.beginTransmission(LCD_TEXT_ADDR); Wire.write(0x80); Wire.write(c); Wire.endTransmission(); }
+void lcdData(uint8_t d){ Wire.beginTransmission(LCD_TEXT_ADDR); Wire.write(0x40); Wire.write(d); Wire.endTransmission(); }
+void lcdClear(){ lcdCmd(0x01); delay(3); }
+void lcdSetCursor(uint8_t col,uint8_t row){ static const uint8_t o[2]={0x00,0x40}; lcdCmd(0x80 | (o[row%2] + (col%16))); }
+void lcdPrint(const String& s){ for(size_t i=0;i<s.length();++i) lcdData((uint8_t)s[i]); }
+void lcdInitSequence(char mode,uint8_t contrast){
+  lcdCmd(0x39); lcdCmd(0x14); lcdCmd(0x70 | (contrast&0x0F));
+  if(mode=='A') lcdCmd(0x54 | ((contrast>>4)&0x03)); else lcdCmd(0x5C | ((contrast>>4)&0x03));
+  lcdCmd(0x6C); delay(250); lcdCmd(0x38); lcdCmd(0x0C); lcdClear(); lcdCmd(0x06);
+}
+void rgbWrite(uint8_t reg,uint8_t val){ Wire.beginTransmission(LCD_RGB_ADDR); Wire.write(reg); Wire.write(val); Wire.endTransmission(); }
+void lcdSetRGB(uint8_t r,uint8_t g,uint8_t b){
+  rgbWrite(0x00,0x00); rgbWrite(0x01,0x00); rgbWrite(0x08,0xAA);
+  rgbWrite(0x04,r); rgbWrite(0x03,g); rgbWrite(0x02,b);
 }
 
-/* -------------------- Sequence block renderer -------------------- */
-function SequenceBlock({ it, index, updateItem, moveUp, moveDown, remove }) {
-  switch (it.type) {
-    case "move":
-      return (
-        <BlockShell color={COLORS.motion} title="🚗 Move" onUp={moveUp} onDown={moveDown} onDelete={remove}>
-          <label>
-            direction:
-            <select
-              value={it.dir}
-              onChange={(e) => updateItem(it.id, { dir: e.target.value })}
-              style={sel}
-            >
-              <option value="forward">forward</option>
-              <option value="backward">backward</option>
-            </select>
-          </label>
-          <label>
-            seconds:
-            <input
-              type="number" step="0.1" min="0"
-              value={it.seconds}
-              onChange={(e) => updateItem(it.id, { seconds: e.target.value })}
-              style={num}
-            />
-          </label>
-        </BlockShell>
-      );
+// ---------- Motor helpers (simple) ----------
+static inline void setStandby(bool on){ digitalWrite(STBY, on?HIGH:LOW); }
 
-    case "beep":
-      return (
-        <BlockShell color={COLORS.sound} title="🔔 Beep" onUp={moveUp} onDown={moveDown} onDelete={remove}/>
-      );
+void leftSpeed(int s){
+  s*=OFFSET_L; if(s>=0){ digitalWrite(AIN1,HIGH); digitalWrite(AIN2,LOW);} else {digitalWrite(AIN1,LOW); digitalWrite(AIN2,HIGH); s=-s;}
+  if(s>255)s=255; ledcWrite(PWMA,s);
+}
+void rightSpeed(int s){
+  s*=OFFSET_R; if(s>=0){ digitalWrite(BIN1,HIGH); digitalWrite(BIN2,LOW);} else {digitalWrite(BIN1,LOW); digitalWrite(BIN2,HIGH); s=-s;}
+  if(s>255)s=255; ledcWrite(PWMB,s);
+}
+void brakeLeft(){ digitalWrite(AIN1,HIGH); digitalWrite(AIN2,HIGH); ledcWrite(PWMA,0); }
+void brakeRight(){ digitalWrite(BIN1,HIGH); digitalWrite(BIN2,HIGH); ledcWrite(PWMB,0); }
+void brakeBoth(){ brakeLeft(); brakeRight(); }
 
-    case "note":
-      return (
-        <BlockShell color={COLORS.sound} title="🎵 Note" onUp={moveUp} onDown={moveDown} onDelete={remove}>
-          <select
-            value={it.name}
-            onChange={(e) => updateItem(it.id, { name: e.target.value })}
-            style={sel}
-          >
-            {NOTE_OPTIONS.map((n) => <option key={n} value={n}>{n}</option>)}
-          </select>
-          <label>
-            beats:
-            <input
-              type="number" step="0.1" min="0.1"
-              value={it.beats}
-              onChange={(e) => updateItem(it.id, { beats: e.target.value })}
-              style={num}
-            />
-          </label>
-        </BlockShell>
-      );
+// non-blocking duration
+volatile bool motorActive=false;
+volatile uint32_t motorUntilMs=0;
 
-    case "mary":
-      return (
-        <BlockShell color={COLORS.sound} title="🎶 Mary Had a Little Lamb" onUp={moveUp} onDown={moveDown} onDelete={remove}/>
-      );
+void motorsApplySimple(const String& lcmd, const String& rcmd, int lspd=255, int rspd=255){
+  setStandby(true);
 
-    case "rgb":
-      return (
-        <BlockShell color={COLORS.display} title="💡 RGB" onUp={moveUp} onDown={moveDown} onDelete={remove}>
-          <label title="Prefer hex if set">
-            hex:
-            <input
-              type="text"
-              value={it.hex}
-              onChange={(e) => updateItem(it.id, { hex: e.target.value })}
-              placeholder="#RRGGBB"
-              style={text}
-            />
-          </label>
-          <span style={{opacity:.6}}>(or r,g,b)</span>
-          <label>r:<input type="number" min="0" max="255" value={it.r} onChange={(e)=>updateItem(it.id,{r:e.target.value})} style={num}/></label>
-          <label>g:<input type="number" min="0" max="255" value={it.g} onChange={(e)=>updateItem(it.id,{g:e.target.value})} style={num}/></label>
-          <label>b:<input type="number" min="0" max="255" value={it.b} onChange={(e)=>updateItem(it.id,{b:e.target.value})} style={num}/></label>
-        </BlockShell>
-      );
+  lspd = constrain(lspd, 0, 255);
+  rspd = constrain(rspd, 0, 255);
 
-    case "lcd":
-      return (
-        <BlockShell color={COLORS.display} title="📺 LCD" onUp={moveUp} onDown={moveDown} onDelete={remove}>
-          <input
-            type="text"
-            value={it.msg}
-            onChange={(e) => updateItem(it.id, { msg: e.target.value })}
-            placeholder="Message"
-            style={{...text, minWidth: 180}}
-          />
-          <label>
-            row:
-            <select
-              value={it.row}
-              onChange={(e) => updateItem(it.id, { row: Number(e.target.value) })}
-              style={sel}
-            >
-              <option value={0}>0</option>
-              <option value={1}>1</option>
-            </select>
-          </label>
-          <label>
-            align:
-            <select
-              value={it.align}
-              onChange={(e) => updateItem(it.id, { align: e.target.value })}
-              style={sel}
-            >
-              <option value="left">left</option>
-              <option value="center">center</option>
-              <option value="right">right</option>
-            </select>
-          </label>
-          <label title="Backlight (prefer hex if set)">
-            hex:
-            <input
-              type="text"
-              value={it.hex}
-              onChange={(e) => updateItem(it.id, { hex: e.target.value })}
-              placeholder="#00AEEF"
-              style={text}
-            />
-          </label>
-          <span style={{opacity:.6}}>(or r,g,b)</span>
-          <label>r:<input type="number" min="0" max="255" value={it.r} onChange={(e)=>updateItem(it.id,{r:e.target.value})} style={num}/></label>
-          <label>g:<input type="number" min="0" max="255" value={it.g} onChange={(e)=>updateItem(it.id,{g:e.target.value})} style={num}/></label>
-          <label>b:<input type="number" min="0" max="255" value={it.b} onChange={(e)=>updateItem(it.id,{b:e.target.value})} style={num}/></label>
-        </BlockShell>
-      );
+  int L = 0, R = 0;
+  if (lcmd == "fwd")  L = +lspd;
+  if (lcmd == "back") L = -lspd;
 
-    case "wait":
-      return (
-        <BlockShell color={COLORS.control} title="⏱️ Wait" onUp={moveUp} onDown={moveDown} onDelete={remove}>
-          <label>
-            seconds:
-            <input
-              type="number" step="0.1" min="0"
-              value={it.seconds}
-              onChange={(e) => updateItem(it.id, { seconds: e.target.value })}
-              style={num}
-            />
-          </label>
-        </BlockShell>
-      );
+  if (rcmd == "fwd")  R = +rspd;
+  if (rcmd == "back") R = -rspd;
 
-    case "rainbowStart":
-      return (
-        <BlockShell color={COLORS.fx} title="🌈 Rainbow Start" onUp={moveUp} onDown={moveDown} onDelete={remove}>
-          <label>interval (ms):
-            <input type="number" min="5" max="1000" step="5"
-              value={it.interval}
-              onChange={(e)=>updateItem(it.id,{interval:Number(e.target.value)})}
-              style={num}/>
-          </label>
-          <label>sat:
-            <input type="number" min="0" max="255"
-              value={it.sat}
-              onChange={(e)=>updateItem(it.id,{sat:Number(e.target.value)})}
-              style={num}/>
-          </label>
-          <label>val:
-            <input type="number" min="0" max="255"
-              value={it.val}
-              onChange={(e)=>updateItem(it.id,{val:Number(e.target.value)})}
-              style={num}/>
-          </label>
-        </BlockShell>
-      );
+  leftSpeed(L);
+  rightSpeed(R);
 
-    case "rainbowStop":
-      return (
-        <BlockShell color={COLORS.fx} title="🛑 Rainbow Stop" onUp={moveUp} onDown={moveDown} onDelete={remove}/>
-      );
-
-    default:
-      return null;
+  if (L == 0 && R == 0) {
+    brakeBoth();
+    setStandby(false);
   }
 }
 
-/* Inputs */
-const sel = {
-  marginLeft: 6,
-  padding: "8px 10px",
-  border: "1px solid #e5e7eb",
-  borderRadius: 10,
-};
-const num = {
-  marginLeft: 6,
-  width: 90,
-  padding: "8px 10px",
-  border: "1px solid #e5e7eb",
-  borderRadius: 10,
-};
-const text = {
-  marginLeft: 6,
-  width: 160,
-  padding: "8px 10px",
-  border: "1px solid #e5e7eb",
-  borderRadius: 10,
-};
+
+// ---------- HTML ----------
+String htmlPage(){
+  String ip=WiFi.softAPIP().toString();
+  String page =
+    "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'/>"
+    "<title>ESP32 — Buzzer + RGB + LCD + Motor</title>"
+    "<style>"
+    "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f6f7fb;margin:0;padding:24px}"
+    ".card{max-width:920px;margin:0 auto;background:#fff;padding:24px 28px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,.08)}"
+    "h1{margin:0 0 8px;font-size:24px}h3{margin:18px 0 8px}p{color:#444}"
+    ".row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 18px}"
+    "input,select{font-size:16px;padding:10px 12px;border:1px solid #ddd;border-radius:10px}"
+    "button{font-size:16px;padding:12px 18px;border:none;border-radius:10px;cursor:pointer;background:#4CAF50;color:#fff}"
+    ".btn-red{background:#E53935}.btn-blue{background:#1E88E5}.btn-orange{background:#FB8C00}.btn-gray{background:#757575}"
+    ".hint{color:#777;font-size:14px}form{display:inline}label{display:flex;align-items:center;gap:6px}"
+    "</style></head><body><div class='card'>"
+    "<h1>ESP32 Control Panel (AP: http://" + ip + "/)</h1>"
+    "<p class='hint'>Endpoints: <code>/beep</code>, <code>/note</code>, <code>/mary</code>, <code>/rgb</code>, <code>/lcd</code>, <code>/motor</code></p>"
+
+    "<h3>1) Beep</h3>"
+    "<div class='row'><form action='/beep' method='get'><button>Beep!</button></form></div>"
+
+    "<h3>2) Play a Note</h3>"
+    "<form action='/note' method='get' class='row'>"
+      "<label>Note <input name='name' value='C4' required></label>"
+      "<label>Beats <input name='beats' type='number' min='0.1' step='0.1' value='1' required></label>"
+      "<button class='btn-blue'>Play</button>"
+    "</form>"
+
+    "<h3>3) Mary Had a Little Lamb</h3>"
+    "<div class='row'><form action='/mary' method='get'><button>Play Mary</button></form></div>"
+
+    "<h3>4) NeoPixel RGB (POST /rgb)</h3>"
+    "<p class='hint'>Use <code>hex</code> or <code>r,g,b</code>. Example: <code>hex=%23FF00FF</code></p>"
+    "<form action='/rgb' method='post' class='row'>"
+      "<label>Hex <input name='hex' placeholder='#FF00FF'></label>"
+      "<span class='hint'>or</span>"
+      "<label>R <input name='r' type='number' min='0' max='255' value='0'></label>"
+      "<label>G <input name='g' type='number' min='0' max='255' value='128'></label>"
+      "<label>B <input name='b' type='number' min='0' max='255' value='255'></label>"
+      "<button class='btn-blue'>Set RGB</button>"
+    "</form>"
+
+    "<h3>5) Grove LCD (GET/POST /lcd)</h3>"
+    "<p class='hint'>Params: <code>msg</code> (required), optional <code>row</code>, <code>align</code>, and backlight <code>hex</code> or <code>r,g,b</code></p>"
+    "<form action='/lcd' method='post' class='row'>"
+      "<label>Text <input name='msg' placeholder='Hello, Grove LCD!' required></label>"
+      "<label>Row <input name='row' type='number' min='0' max='1' value='0'></label>"
+      "<label>Align <select name='align'><option>center</option><option>left</option><option>right</option></select></label>"
+      "<label>Hex <input name='hex' placeholder='#00AEEF'></label>"
+      "<button class='btn-blue'>Show</button>"
+    "</form>"
+
+    "<h3>6) Motor (GET/POST /motor)</h3>"
+    "<p class='hint'>Control wheels: <code>l</code>=fwd|back|stop, <code>r</code>=fwd|back|stop, <code>ms</code>=duration (0=keep).</p>"
+
+    "<div class='row'>"
+      "<form action='/motor' method='post'><input type='hidden' name='l' value='0'><input type='hidden' name='r' value='0'><input type='hidden' name='ms' value='0'><button class='btn-red'>STOP</button></form>"
+      "<form action='/motor' method='post'><input type='hidden' name='l' value='fwd'><input type='hidden' name='r' value='fwd'><input type='hidden' name='ms' value='800'><button>Forward 0.8s</button></form>"
+      "<form action='/motor' method='post'><input type='hidden' name='l' value='back'><input type='hidden' name='r' value='back'><input type='hidden' name='ms' value='800'><button>Back 0.8s</button></form>"
+      "<form action='/motor' method='post'><input type='hidden' name='l' value='back'><input type='hidden' name='r' value='fwd'><input type='hidden' name='ms' value='600'><button class='btn-orange'>Spin Left</button></form>"
+      "<form action='/motor' method='post'><input type='hidden' name='l' value='fwd'><input type='hidden' name='r' value='back'><input type='hidden' name='ms' value='600'><button class='btn-orange'>Spin Right</button></form>"
+    "</div>"
+
+    "<form action='/motor' method='post' class='row'>"
+      "<label>L <select name='l'><option>fwd</option><option>back</option><option selected>stop</option></select></label>"
+      "<label>R <select name='r'><option>fwd</option><option>back</option><option selected>stop</option></select></label>"
+      "<label>ms <input name='ms' type='number' min='0' step='50' value='800'></label>"
+      "<button class='btn-blue'>Run</button>"
+    "</form>"
+
+    "</div></body></html>";
+  return page;
+}
+
+// ---------- Handlers ----------
+void handleRoot(){ server.send(200,"text/html",htmlPage()); }
+void handleBeepGET(){ addCORS(); beepOnce(); handleRoot(); server.send(204);}
+void handleNoteGET(){ addCORS(); String name=server.hasArg("name")?server.arg("name"):"C4"; float beats=server.hasArg("beats")?server.arg("beats").toFloat():1.0f; if(beats<=0)beats=0.25f; playNoteBeats(name,beats); handleRoot(); server.send(204);}
+void handleMaryGET(){addCORS();  playMary(); handleRoot();server.send(204); }
+
+void handleFxRainbowStart() {
+  addCORS();
+  if (server.hasArg("interval")) {
+    uint32_t v = server.arg("interval").toInt();
+    if (v < 5) v = 5; if (v > 1000) v = 1000;
+    FX_RAINBOW_INTERVAL_MS = v;
+  }
+  if (server.hasArg("sat")) {
+    int v = server.arg("sat").toInt(); if (v < 0) v = 0; if (v > 255) v = 255;
+    FX_RAINBOW_SAT = (uint8_t)v;
+  }
+  if (server.hasArg("val")) {
+    int v = server.arg("val").toInt(); if (v < 0) v = 0; if (v > 255) v = 255;
+    FX_RAINBOW_VAL = (uint8_t)v;
+  }
+  FX_RAINBOW_ACTIVE = true;
+  FX_RAINBOW_NEXT_MS = 0; // render immediately
+  server.send(200, "application/json", "{\"ok\":true,\"fx\":\"rainbow\",\"active\":true}");
+}
+
+void handleFxRainbowStop() {
+  addCORS();
+  FX_RAINBOW_ACTIVE = false;
+  // Optionally clear strip (comment out if you want to keep last frame)
+  for (uint16_t i = 0; i < strip.numPixels(); i++) strip.setPixelColor(i, 0);
+  strip.show();
+  server.send(200, "application/json", "{\"ok\":true,\"fx\":\"rainbow\",\"active\":false}");
+}
+
+void handleFxRainbowOptions() { addCORS(); server.send(204); }
+
+void handleRgbOPTIONS(){ handleOptions(); }
+void handleRgbAny(){
+  addCORS();
+  uint8_t r=0,g=0,b=0; bool ok=false;
+  if(server.hasArg("hex")) ok=parseHexColor(server.arg("hex"),r,g,b);
+  else if(server.hasArg("r")||server.hasArg("g")||server.hasArg("b")){
+    r=constrain(server.arg("r").toInt(),0,255);
+    g=constrain(server.arg("g").toInt(),0,255);
+    b=constrain(server.arg("b").toInt(),0,255);
+    ok=true;
+  }
+  if(!ok && server.method()==HTTP_POST){
+    String ct=server.header("Content-Type"); ct.toLowerCase(); String body=server.arg("plain"); body.trim();
+    if(ct.indexOf("text/plain")>=0){
+      if(body.startsWith("#")||body.length()==6) ok=parseHexColor(body,r,g,b);
+      else{
+        int i; if((i=body.indexOf("r="))>=0) r=constrain(body.substring(i+2).toInt(),0,255);
+              if((i=body.indexOf("g="))>=0) g=constrain(body.substring(i+2).toInt(),0,255);
+              if((i=body.indexOf("b="))>=0) b=constrain(body.substring(i+2).toInt(),0,255);
+        ok=true;
+      }
+    }
+  }
+  if(!ok){ server.send(200,"text/html",htmlPage()); return; }
+  setAllColor(r,g,b);
+  server.send(200,"text/html",htmlPage());
+}
+
+// LCD
+void handleLcdOPTIONS(){ handleOptions(); }
+void handleLcdAny(){
+  addCORS();
+  String msg; bool ok=false; int row=0; String align="center"; uint8_t cr=0,cg=128,cb=255; bool hasColor=false;
+  if(server.hasArg("msg")){ msg=server.arg("msg"); ok=true; }
+  if(server.hasArg("row")) row=constrain(server.arg("row").toInt(),0,1);
+  if(server.hasArg("align")){ String a=server.arg("align"); a.toLowerCase(); if(a=="left"||a=="right"||a=="center") align=a; }
+  if(server.hasArg("hex")) hasColor=parseHexColor(server.arg("hex"),cr,cg,cb);
+  if(!hasColor && (server.hasArg("r")||server.hasArg("g")||server.hasArg("b"))){
+    cr=constrain(server.arg("r").toInt(),0,255);
+    cg=constrain(server.arg("g").toInt(),0,255);
+    cb=constrain(server.arg("b").toInt(),0,255);
+    hasColor=true;
+  }
+  if(!ok && server.method()==HTTP_POST){ String body=server.arg("plain"); body.trim(); if(body.length()>0){ msg=body; ok=true; } }
+  if(!ok){ server.send(400,"application/json","{\"error\":\"invalid params\"}"); return; }
+  if(hasColor) lcdSetRGB(cr,cg,cb);
+
+  if(msg.indexOf('\n')>=0){
+    String l1=msg.substring(0,msg.indexOf('\n'));
+    String l2=msg.substring(msg.indexOf('\n')+1);
+    lcdClear(); lcdSetCursor(0,0); lcdPrint(centered16(l1));
+               lcdSetCursor(0,1); lcdPrint(centered16(l2));
+  } else {
+    if(align=="center"){ lcdClear(); lcdSetCursor(0,row); lcdPrint(centered16(msg)); }
+    else {
+      String t=msg; t.trim(); if((int)t.length()>LCD_COLS) t=t.substring(0,LCD_COLS);
+      int col=(align=="right")?(LCD_COLS - t.length()):0;
+      lcdSetCursor(0,row); for(int i=0;i<LCD_COLS;i++) lcdData(' ');
+      lcdSetCursor(col,row); lcdPrint(t);
+    }
+  }
+  server.send(200,"text/html",htmlPage());
+}
+void handleTurnOPTIONS(){ handleOptions(); }
+void handleTurnGET(){
+  addCORS();
+  String dir = server.hasArg("dir") ? server.arg("dir") : "left";  dir.toLowerCase();
+  String mode = server.hasArg("mode") ? server.arg("mode") : "spin"; mode.toLowerCase();
+  uint32_t ms = server.hasArg("ms") ? nonneg_ms(server.arg("ms").toInt()) : 600;
+  int spd = server.hasArg("spd") ? constrain(server.arg("spd").toInt(), 0, 255) : 200;
+
+  String lcmd="stop", rcmd="stop";
+  if (mode == "spin") {
+    // Spin in place
+    if (dir == "left")  { lcmd="back"; rcmd="fwd"; }
+    else                { lcmd="fwd";  rcmd="back"; }
+  } else {
+    // Arc: one side stopped, other forward
+    if (dir == "left")  { lcmd="stop"; rcmd="fwd"; }
+    else                { lcmd="fwd";  rcmd="stop"; }
+  }
+
+  server.send(200, "application/json",
+    String("{\"ok\":true,\"dir\":\"")+dir+"\",\"mode\":\""+mode+"\",\"ms\":"+ms+",\"spd\":"+spd+"}");
+
+  motorsApplySimple(lcmd, rcmd, spd, spd);
+  if(ms>0){ motorUntilMs=millis()+ms; motorActive=true; } else { motorActive=false; }
+}
+// MOTOR (simple): l=fwd|back|stop, r=fwd|back|stop, ms=duration
+void handleMotorOPTIONS(){ handleOptions(); }
+void handleMotorAny(){
+  addCORS();
+  String l = server.hasArg("l") ? server.arg("l") : "stop";
+  String r = server.hasArg("r") ? server.arg("r") : "stop";
+  uint32_t ms = server.hasArg("ms") ? nonneg_ms(server.arg("ms").toInt()) : 0;
+
+  // Optional speeds: ls, rs or a single spd for both
+  int spd = server.hasArg("spd") ? server.arg("spd").toInt() : 255;
+  int ls  = server.hasArg("ls")  ? server.arg("ls").toInt()  : spd;
+  int rs  = server.hasArg("rs")  ? server.arg("rs").toInt()  : spd;
+  ls = constrain(ls, 0, 255);
+  rs = constrain(rs, 0, 255);
+
+  l.toLowerCase(); r.toLowerCase();
+  auto valid=[&](const String& s){ return (s=="fwd"||s=="back"||s=="stop"||s=="0"); };
+  if(!valid(l)||!valid(r)){ server.send(400,"application/json","{\"error\":\"invalid params\"}"); return; }
+  if(l=="0") l="stop"; if(r=="0") r="stop";
+
+  server.send(200,"application/json",
+    String("{\"ok\":true,\"l\":\"")+l+"\",\"r\":\""+r+"\",\"ms\":"+ms+",\"ls\":"+ls+",\"rs\":"+rs+"}");
+
+  motorsApplySimple(l, r, ls, rs);
+  if(ms>0){ motorUntilMs=millis()+ms; motorActive=true; } else { motorActive=false; }
+}
+
+// ---------- Setup / Loop ----------
+void setup(){
+  Serial.begin(115200);
+  delay(150);
+
+  // Motors
+  pinMode(AIN1,OUTPUT); pinMode(AIN2,OUTPUT);
+  pinMode(BIN1,OUTPUT); pinMode(BIN2,OUTPUT);
+  pinMode(STBY,OUTPUT);
+  setStandby(false); brakeBoth();
+  ledcAttach(PWMA, MOT_PWM_FREQ, MOT_PWM_RES);
+  ledcAttach(PWMB, MOT_PWM_FREQ, MOT_PWM_RES);
+  ledcWrite(PWMA,0); ledcWrite(PWMB,0);
+
+  // Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  ledcAttach(BUZZER_PIN, BUZ_BASE_HZ, PWM_RES_BUZ);
+  ledcWrite(BUZZER_PIN, 0);
+
+  // NeoPixel
+  strip.begin(); strip.setBrightness(NEO_BRIGHT); strip.show();
+
+  // I2C (LCD)
+  Wire.begin(21,22);
+  Wire.setClock(100000);
+  lcdInitSequence(LCD_MODE, LCD_CONTRAST);
+  lcdSetRGB(0,128,255);
+  lcdClear(); lcdSetCursor(0,0); lcdPrint(centered16("Grove RGB LCD"));
+             lcdSetCursor(0,1); lcdPrint(centered16("AP ready"));
+
+  
+
+  // Wi-Fi AP
+  WiFi.mode(WIFI_AP);
+  bool ok=WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.printf("AP start: %s\n", ok?"OK":"FAILED");
+  Serial.print("SSID: "); Serial.println(AP_SSID);
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+  // Routes
+  server.on("/",     HTTP_GET,      handleRoot);
+  server.on("/beep", HTTP_GET,      handleBeepGET);
+  server.on("/note", HTTP_GET,      handleNoteGET);
+  server.on("/mary", HTTP_GET,      handleMaryGET);
+
+  server.on("/rgb",  HTTP_OPTIONS,  handleRgbOPTIONS);
+  server.on("/rgb",  HTTP_ANY,      handleRgbAny);
+
+  server.on("/lcd",  HTTP_OPTIONS,  handleLcdOPTIONS);
+  server.on("/lcd",  HTTP_ANY,      handleLcdAny);
+
+  server.on("/motor",HTTP_OPTIONS,  handleMotorOPTIONS);
+  server.on("/motor",HTTP_ANY,      handleMotorAny);
+
+  server.on("/fx/rainbow/start", HTTP_OPTIONS, handleFxRainbowOptions);
+  server.on("/fx/rainbow/start", HTTP_GET,     handleFxRainbowStart);
+  server.on("/fx/rainbow/stop",  HTTP_OPTIONS, handleFxRainbowOptions);
+  server.on("/fx/rainbow/stop",  HTTP_GET,     handleFxRainbowStop);
+
+  server.on("/turn", HTTP_OPTIONS, handleTurnOPTIONS);
+  server.on("/turn", HTTP_GET,     handleTurnGET);
+
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop(){
+  server.handleClient();
+
+  // Motor auto-stop
+  if(motorActive && (int32_t)(millis() - motorUntilMs) >= 0){
+    brakeBoth(); setStandby(false); motorActive=false;
+  }
+
+  if (FX_RAINBOW_ACTIVE) {
+    uint32_t now = millis();
+    if ((int32_t)(now - FX_RAINBOW_NEXT_MS) >= 0) {
+      rainbowStep();
+      FX_RAINBOW_NEXT_MS = now + FX_RAINBOW_INTERVAL_MS;
+    }
+  }
+
+}
