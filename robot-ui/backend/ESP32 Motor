@@ -1,0 +1,398 @@
+// ESP32 (Arduino Core 3.x)
+// SoftAP + Buzzer + NeoPixel (/rgb) + Grove RGB LCD (/lcd) + Simple Motor (/motor)
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_NeoPixel.h>
+#include <Wire.h>
+
+// ====== LCD init that matched your working sweep ======
+#define LCD_MODE      'A'     // 'A' or 'B'
+#define LCD_CONTRAST  45      // 25..60
+
+// ====== Access Point ======
+const char* AP_SSID     = "esp32-bot";
+const char* AP_PASSWORD = "hackme123";
+
+// ====== Buzzer ======
+const int   BUZZER_PIN  = 17;
+const uint8_t PWM_RES_BUZ = 12;   // 12-bit (0..4095) for buzzer
+const int   TEMPO_BPM    = 120;
+const int   BEAT_MS      = 60000 / TEMPO_BPM;
+const int   BUZ_BASE_HZ  = 2000;  // initial buzzer freq
+
+// ====== NeoPixel ======
+#define NEO_PIN    15
+#define NEO_COUNT  8
+#define NEO_BRIGHT 60
+Adafruit_NeoPixel strip(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
+
+// ====== Grove LCD I2C addrs ======
+#define LCD_TEXT_ADDR 0x3E
+#define LCD_RGB_ADDR  0x62
+const int LCD_COLS = 16;
+const int LCD_ROWS = 2;
+
+// ====== Motor driver (TB6612FNG) ======
+#define AIN1 13
+#define AIN2 14
+#define PWMA 32   // LEFT PWM
+
+#define BIN1 27
+#define BIN2 4    // avoid 12/16 on some ESP32 variants
+#define PWMB 25   // RIGHT PWM
+
+#define STBY 33   // HIGH = enable
+
+static const int MOT_PWM_FREQ = 18000; // 18 kHz
+static const int MOT_PWM_RES  = 8;     // 0..255
+int OFFSET_L = +1;
+int OFFSET_R = +1;
+
+// ====== HTTP server ======
+WebServer server(80);
+
+// ====== Helpers ======
+static inline uint32_t nonneg_ms(long v) { return (v < 0) ? 0u : (uint32_t)v; }
+
+static inline void addCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+void handleOptions() { addCORS(); server.send(204); }
+
+// ---------- Notes & Buzzer ----------
+struct NoteMap { const char* name; uint16_t freq; };
+static const NoteMap NOTES[] = {
+  {"C3",131},{"D3",147},{"E3",165},{"F3",175},{"G3",196},{"A3",220},{"B3",247},
+  {"C4",262},{"D4",294},{"E4",330},{"F4",349},{"G4",392},{"A4",440},{"B4",494},
+  {"C5",523},{"D5",587},{"E5",659},{"F5",698},{"G5",784},{"A5",880},{"B5",988},
+  {"C6",1047},{"D6",1175},{"E6",1319},{"F6",1397},{"G6",1568}
+};
+uint16_t noteFreq(const String& name) {
+  for (auto &n : NOTES) if (name.equalsIgnoreCase(n.name)) return n.freq;
+  return 0;
+}
+void toneMs(uint16_t freqHz, uint16_t durationMs) {
+  if (freqHz == 0 || durationMs == 0) return;
+  // Only reprogram the buzzer's own channel/timer
+  ledcChangeFrequency(BUZZER_PIN, freqHz, PWM_RES_BUZ);
+  // ~50% duty for a clear tone (half of 12-bit range)
+  ledcWrite(BUZZER_PIN, 2048);
+  delay(durationMs);
+  ledcWrite(BUZZER_PIN, 0);  // silence, keep channel allocated
+}
+void beepOnce(){ toneMs(2000,500); }
+void playNoteBeats(const String& name, float beats){
+  uint16_t f=noteFreq(name); int dur=(int)(beats*BEAT_MS); if(dur<1)dur=1;
+  if(f==0) delay(dur); else toneMs(f,dur);
+}
+const char* MARY_NOTES[] = {
+  "E4","D4","C4","D4","E4","E4","E4",
+  "D4","D4","D4","E4","G4","G4",
+  "E4","D4","C4","D4","E4","E4","E4","E4",
+  "D4","D4","E4","D4","C4"
+};
+const float MARY_BEATS[] = {
+  1,1,1,1,1,1,2,
+  1,1,2,1,1,2,
+  1,1,1,1,1,1,1,1,
+  1,1,1,1,2
+};
+const size_t MARY_LEN = sizeof(MARY_BEATS)/sizeof(MARY_BEATS[0]);
+void playMary(){ for(size_t i=0;i<MARY_LEN;++i){ playNoteBeats(String(MARY_NOTES[i]), MARY_BEATS[i]); delay(BEAT_MS/10); } }
+
+// ---------- Color helpers ----------
+uint8_t hexNibble(char c){ if(c>='0'&&c<='9')return c-'0'; c|=0x20; if(c>='a'&&c<='f')return 10+(c-'a'); return 0; }
+bool parseHexColor(const String& s,uint8_t& r,uint8_t& g,uint8_t& b){
+  String t=s; t.trim(); if(t.length()==0) return false; if(t[0]=='#') t.remove(0,1); if(t.length()!=6) return false;
+  r=(hexNibble(t[0])<<4)|hexNibble(t[1]); g=(hexNibble(t[2])<<4)|hexNibble(t[3]); b=(hexNibble(t[4])<<4)|hexNibble(t[5]); return true;
+}
+void setAllColor(uint8_t r,uint8_t g,uint8_t b){
+  for(uint16_t i=0;i<strip.numPixels();i++) strip.setPixelColor(i, strip.Color(r,g,b));
+  strip.show();
+}
+
+// ---------- LCD helpers ----------
+String centered16(const String& s){
+  String t=s; t.trim(); if((int)t.length()>=LCD_COLS) return t.substring(0,LCD_COLS);
+  int pad=(LCD_COLS - t.length())/2; String left="", right="";
+  for(int i=0;i<pad;i++) left+=' ';
+  for(int i=0;i<(LCD_COLS-pad-t.length());i++) right+=' ';
+  return left+t+right;
+}
+void lcdCmd(uint8_t c){ Wire.beginTransmission(LCD_TEXT_ADDR); Wire.write(0x80); Wire.write(c); Wire.endTransmission(); }
+void lcdData(uint8_t d){ Wire.beginTransmission(LCD_TEXT_ADDR); Wire.write(0x40); Wire.write(d); Wire.endTransmission(); }
+void lcdClear(){ lcdCmd(0x01); delay(3); }
+void lcdSetCursor(uint8_t col,uint8_t row){ static const uint8_t o[2]={0x00,0x40}; lcdCmd(0x80 | (o[row%2] + (col%16))); }
+void lcdPrint(const String& s){ for(size_t i=0;i<s.length();++i) lcdData((uint8_t)s[i]); }
+void lcdInitSequence(char mode,uint8_t contrast){
+  lcdCmd(0x39); lcdCmd(0x14); lcdCmd(0x70 | (contrast&0x0F));
+  if(mode=='A') lcdCmd(0x54 | ((contrast>>4)&0x03)); else lcdCmd(0x5C | ((contrast>>4)&0x03));
+  lcdCmd(0x6C); delay(250); lcdCmd(0x38); lcdCmd(0x0C); lcdClear(); lcdCmd(0x06);
+}
+void rgbWrite(uint8_t reg,uint8_t val){ Wire.beginTransmission(LCD_RGB_ADDR); Wire.write(reg); Wire.write(val); Wire.endTransmission(); }
+void lcdSetRGB(uint8_t r,uint8_t g,uint8_t b){
+  rgbWrite(0x00,0x00); rgbWrite(0x01,0x00); rgbWrite(0x08,0xAA);
+  rgbWrite(0x04,r); rgbWrite(0x03,g); rgbWrite(0x02,b);
+}
+
+// ---------- Motor helpers (simple) ----------
+static inline void setStandby(bool on){ digitalWrite(STBY, on?HIGH:LOW); }
+
+void leftSpeed(int s){
+  s*=OFFSET_L; if(s>=0){ digitalWrite(AIN1,HIGH); digitalWrite(AIN2,LOW);} else {digitalWrite(AIN1,LOW); digitalWrite(AIN2,HIGH); s=-s;}
+  if(s>255)s=255; ledcWrite(PWMA,s);
+}
+void rightSpeed(int s){
+  s*=OFFSET_R; if(s>=0){ digitalWrite(BIN1,HIGH); digitalWrite(BIN2,LOW);} else {digitalWrite(BIN1,LOW); digitalWrite(BIN2,HIGH); s=-s;}
+  if(s>255)s=255; ledcWrite(PWMB,s);
+}
+void brakeLeft(){ digitalWrite(AIN1,HIGH); digitalWrite(AIN2,HIGH); ledcWrite(PWMA,0); }
+void brakeRight(){ digitalWrite(BIN1,HIGH); digitalWrite(BIN2,HIGH); ledcWrite(PWMB,0); }
+void brakeBoth(){ brakeLeft(); brakeRight(); }
+
+// non-blocking duration
+volatile bool motorActive=false;
+volatile uint32_t motorUntilMs=0;
+
+void motorsApplySimple(const String& lcmd,const String& rcmd){
+  setStandby(true);
+  int L=0,R=0;
+  if(lcmd=="fwd")  L=+255;
+  if(lcmd=="back") L=-255;
+  if(rcmd=="fwd")  R=+255;
+  if(rcmd=="back") R=-255;
+  leftSpeed(L); rightSpeed(R);
+  if(L==0 && R==0){ brakeBoth(); setStandby(false); }
+}
+
+// ---------- HTML ----------
+String htmlPage(){
+  String ip=WiFi.softAPIP().toString();
+  String page =
+    "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'/>"
+    "<title>ESP32 — Buzzer + RGB + LCD + Motor</title>"
+    "<style>"
+    "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f6f7fb;margin:0;padding:24px}"
+    ".card{max-width:920px;margin:0 auto;background:#fff;padding:24px 28px;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,.08)}"
+    "h1{margin:0 0 8px;font-size:24px}h3{margin:18px 0 8px}p{color:#444}"
+    ".row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 18px}"
+    "input,select{font-size:16px;padding:10px 12px;border:1px solid #ddd;border-radius:10px}"
+    "button{font-size:16px;padding:12px 18px;border:none;border-radius:10px;cursor:pointer;background:#4CAF50;color:#fff}"
+    ".btn-red{background:#E53935}.btn-blue{background:#1E88E5}.btn-orange{background:#FB8C00}.btn-gray{background:#757575}"
+    ".hint{color:#777;font-size:14px}form{display:inline}label{display:flex;align-items:center;gap:6px}"
+    "</style></head><body><div class='card'>"
+    "<h1>ESP32 Control Panel (AP: http://" + ip + "/)</h1>"
+    "<p class='hint'>Endpoints: <code>/beep</code>, <code>/note</code>, <code>/mary</code>, <code>/rgb</code>, <code>/lcd</code>, <code>/motor</code></p>"
+
+    "<h3>1) Beep</h3>"
+    "<div class='row'><form action='/beep' method='get'><button>Beep!</button></form></div>"
+
+    "<h3>2) Play a Note</h3>"
+    "<form action='/note' method='get' class='row'>"
+      "<label>Note <input name='name' value='C4' required></label>"
+      "<label>Beats <input name='beats' type='number' min='0.1' step='0.1' value='1' required></label>"
+      "<button class='btn-blue'>Play</button>"
+    "</form>"
+
+    "<h3>3) Mary Had a Little Lamb</h3>"
+    "<div class='row'><form action='/mary' method='get'><button>Play Mary</button></form></div>"
+
+    "<h3>4) NeoPixel RGB (POST /rgb)</h3>"
+    "<p class='hint'>Use <code>hex</code> or <code>r,g,b</code>. Example: <code>hex=%23FF00FF</code></p>"
+    "<form action='/rgb' method='post' class='row'>"
+      "<label>Hex <input name='hex' placeholder='#FF00FF'></label>"
+      "<span class='hint'>or</span>"
+      "<label>R <input name='r' type='number' min='0' max='255' value='0'></label>"
+      "<label>G <input name='g' type='number' min='0' max='255' value='128'></label>"
+      "<label>B <input name='b' type='number' min='0' max='255' value='255'></label>"
+      "<button class='btn-blue'>Set RGB</button>"
+    "</form>"
+
+    "<h3>5) Grove LCD (GET/POST /lcd)</h3>"
+    "<p class='hint'>Params: <code>msg</code> (required), optional <code>row</code>, <code>align</code>, and backlight <code>hex</code> or <code>r,g,b</code></p>"
+    "<form action='/lcd' method='post' class='row'>"
+      "<label>Text <input name='msg' placeholder='Hello, Grove LCD!' required></label>"
+      "<label>Row <input name='row' type='number' min='0' max='1' value='0'></label>"
+      "<label>Align <select name='align'><option>center</option><option>left</option><option>right</option></select></label>"
+      "<label>Hex <input name='hex' placeholder='#00AEEF'></label>"
+      "<button class='btn-blue'>Show</button>"
+    "</form>"
+
+    "<h3>6) Motor (GET/POST /motor)</h3>"
+    "<p class='hint'>Control wheels: <code>l</code>=fwd|back|stop, <code>r</code>=fwd|back|stop, <code>ms</code>=duration (0=keep).</p>"
+
+    "<div class='row'>"
+      "<form action='/motor' method='post'><input type='hidden' name='l' value='0'><input type='hidden' name='r' value='0'><input type='hidden' name='ms' value='0'><button class='btn-red'>STOP</button></form>"
+      "<form action='/motor' method='post'><input type='hidden' name='l' value='fwd'><input type='hidden' name='r' value='fwd'><input type='hidden' name='ms' value='800'><button>Forward 0.8s</button></form>"
+      "<form action='/motor' method='post'><input type='hidden' name='l' value='back'><input type='hidden' name='r' value='back'><input type='hidden' name='ms' value='800'><button>Back 0.8s</button></form>"
+      "<form action='/motor' method='post'><input type='hidden' name='l' value='back'><input type='hidden' name='r' value='fwd'><input type='hidden' name='ms' value='600'><button class='btn-orange'>Spin Left</button></form>"
+      "<form action='/motor' method='post'><input type='hidden' name='l' value='fwd'><input type='hidden' name='r' value='back'><input type='hidden' name='ms' value='600'><button class='btn-orange'>Spin Right</button></form>"
+    "</div>"
+
+    "<form action='/motor' method='post' class='row'>"
+      "<label>L <select name='l'><option>fwd</option><option>back</option><option selected>stop</option></select></label>"
+      "<label>R <select name='r'><option>fwd</option><option>back</option><option selected>stop</option></select></label>"
+      "<label>ms <input name='ms' type='number' min='0' step='50' value='800'></label>"
+      "<button class='btn-blue'>Run</button>"
+    "</form>"
+
+    "</div></body></html>";
+  return page;
+}
+
+// ---------- Handlers ----------
+void handleRoot(){ server.send(200,"text/html",htmlPage()); }
+void handleBeepGET(){ beepOnce(); handleRoot(); }
+void handleNoteGET(){ String name=server.hasArg("name")?server.arg("name"):"C4"; float beats=server.hasArg("beats")?server.arg("beats").toFloat():1.0f; if(beats<=0)beats=0.25f; playNoteBeats(name,beats); handleRoot(); }
+void handleMaryGET(){ playMary(); handleRoot(); }
+
+void handleRgbOPTIONS(){ handleOptions(); }
+void handleRgbAny(){
+  addCORS();
+  uint8_t r=0,g=0,b=0; bool ok=false;
+  if(server.hasArg("hex")) ok=parseHexColor(server.arg("hex"),r,g,b);
+  else if(server.hasArg("r")||server.hasArg("g")||server.hasArg("b")){
+    r=constrain(server.arg("r").toInt(),0,255);
+    g=constrain(server.arg("g").toInt(),0,255);
+    b=constrain(server.arg("b").toInt(),0,255);
+    ok=true;
+  }
+  if(!ok && server.method()==HTTP_POST){
+    String ct=server.header("Content-Type"); ct.toLowerCase(); String body=server.arg("plain"); body.trim();
+    if(ct.indexOf("text/plain")>=0){
+      if(body.startsWith("#")||body.length()==6) ok=parseHexColor(body,r,g,b);
+      else{
+        int i; if((i=body.indexOf("r="))>=0) r=constrain(body.substring(i+2).toInt(),0,255);
+              if((i=body.indexOf("g="))>=0) g=constrain(body.substring(i+2).toInt(),0,255);
+              if((i=body.indexOf("b="))>=0) b=constrain(body.substring(i+2).toInt(),0,255);
+        ok=true;
+      }
+    }
+  }
+  if(!ok){ server.send(200,"text/html",htmlPage()); return; }
+  setAllColor(r,g,b);
+  server.send(200,"text/html",htmlPage());
+}
+
+// LCD
+void handleLcdOPTIONS(){ handleOptions(); }
+void handleLcdAny(){
+  addCORS();
+  String msg; bool ok=false; int row=0; String align="center"; uint8_t cr=0,cg=128,cb=255; bool hasColor=false;
+  if(server.hasArg("msg")){ msg=server.arg("msg"); ok=true; }
+  if(server.hasArg("row")) row=constrain(server.arg("row").toInt(),0,1);
+  if(server.hasArg("align")){ String a=server.arg("align"); a.toLowerCase(); if(a=="left"||a=="right"||a=="center") align=a; }
+  if(server.hasArg("hex")) hasColor=parseHexColor(server.arg("hex"),cr,cg,cb);
+  if(!hasColor && (server.hasArg("r")||server.hasArg("g")||server.hasArg("b"))){
+    cr=constrain(server.arg("r").toInt(),0,255);
+    cg=constrain(server.arg("g").toInt(),0,255);
+    cb=constrain(server.arg("b").toInt(),0,255);
+    hasColor=true;
+  }
+  if(!ok && server.method()==HTTP_POST){ String body=server.arg("plain"); body.trim(); if(body.length()>0){ msg=body; ok=true; } }
+  if(!ok){ server.send(400,"application/json","{\"error\":\"invalid params\"}"); return; }
+  if(hasColor) lcdSetRGB(cr,cg,cb);
+
+  if(msg.indexOf('\n')>=0){
+    String l1=msg.substring(0,msg.indexOf('\n'));
+    String l2=msg.substring(msg.indexOf('\n')+1);
+    lcdClear(); lcdSetCursor(0,0); lcdPrint(centered16(l1));
+               lcdSetCursor(0,1); lcdPrint(centered16(l2));
+  } else {
+    if(align=="center"){ lcdClear(); lcdSetCursor(0,row); lcdPrint(centered16(msg)); }
+    else {
+      String t=msg; t.trim(); if((int)t.length()>LCD_COLS) t=t.substring(0,LCD_COLS);
+      int col=(align=="right")?(LCD_COLS - t.length()):0;
+      lcdSetCursor(0,row); for(int i=0;i<LCD_COLS;i++) lcdData(' ');
+      lcdSetCursor(col,row); lcdPrint(t);
+    }
+  }
+  server.send(200,"text/html",htmlPage());
+}
+
+// MOTOR (simple): l=fwd|back|stop, r=fwd|back|stop, ms=duration
+void handleMotorOPTIONS(){ handleOptions(); }
+void handleMotorAny(){
+  addCORS();
+  String l = server.hasArg("l") ? server.arg("l") : "stop";
+  String r = server.hasArg("r") ? server.arg("r") : "stop";
+  uint32_t ms = server.hasArg("ms") ? nonneg_ms(server.arg("ms").toInt()) : 0;
+  l.toLowerCase(); r.toLowerCase();
+  auto valid=[&](const String& s){ return (s=="fwd"||s=="back"||s=="stop"||s=="0"); };
+  if(!valid(l)||!valid(r)){ server.send(400,"application/json","{\"error\":\"invalid params\"}"); return; }
+  if(l=="0") l="stop"; if(r=="0") r="stop";
+
+  server.send(200,"application/json", String("{\"ok\":true,\"l\":\"")+l+"\",\"r\":\""+r+"\",\"ms\":"+ms+"}");
+  motorsApplySimple(l,r);
+  if(ms>0){ motorUntilMs=millis()+ms; motorActive=true; } else { motorActive=false; }
+}
+
+// ---------- Setup / Loop ----------
+void setup(){
+  Serial.begin(115200);
+  delay(150);
+
+  // Motors
+  pinMode(AIN1,OUTPUT); pinMode(AIN2,OUTPUT);
+  pinMode(BIN1,OUTPUT); pinMode(BIN2,OUTPUT);
+  pinMode(STBY,OUTPUT);
+  setStandby(false); brakeBoth();
+  ledcAttach(PWMA, MOT_PWM_FREQ, MOT_PWM_RES);
+  ledcAttach(PWMB, MOT_PWM_FREQ, MOT_PWM_RES);
+  ledcWrite(PWMA,0); ledcWrite(PWMB,0);
+
+  // Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  ledcAttach(BUZZER_PIN, BUZ_BASE_HZ, PWM_RES_BUZ);
+  ledcWrite(BUZZER_PIN, 0);
+
+  // NeoPixel
+  strip.begin(); strip.setBrightness(NEO_BRIGHT); strip.show();
+
+  // I2C (LCD)
+  Wire.begin(21,22);
+  Wire.setClock(100000);
+  lcdInitSequence(LCD_MODE, LCD_CONTRAST);
+  lcdSetRGB(0,128,255);
+  lcdClear(); lcdSetCursor(0,0); lcdPrint(centered16("Grove RGB LCD"));
+             lcdSetCursor(0,1); lcdPrint(centered16("AP ready"));
+
+  
+
+  // Wi-Fi AP
+  WiFi.mode(WIFI_AP);
+  bool ok=WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.printf("AP start: %s\n", ok?"OK":"FAILED");
+  Serial.print("SSID: "); Serial.println(AP_SSID);
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+  // Routes
+  server.on("/",     HTTP_GET,      handleRoot);
+  server.on("/beep", HTTP_GET,      handleBeepGET);
+  server.on("/note", HTTP_GET,      handleNoteGET);
+  server.on("/mary", HTTP_GET,      handleMaryGET);
+
+  server.on("/rgb",  HTTP_OPTIONS,  handleRgbOPTIONS);
+  server.on("/rgb",  HTTP_ANY,      handleRgbAny);
+
+  server.on("/lcd",  HTTP_OPTIONS,  handleLcdOPTIONS);
+  server.on("/lcd",  HTTP_ANY,      handleLcdAny);
+
+  server.on("/motor",HTTP_OPTIONS,  handleMotorOPTIONS);
+  server.on("/motor",HTTP_ANY,      handleMotorAny);
+
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop(){
+  server.handleClient();
+
+  // Motor auto-stop
+  if(motorActive && (int32_t)(millis() - motorUntilMs) >= 0){
+    brakeBoth(); setStandby(false); motorActive=false;
+  }
+}
