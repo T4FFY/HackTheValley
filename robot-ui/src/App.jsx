@@ -1,790 +1,796 @@
-import React, { useEffect, useRef, useState } from "react";
-import { Play, Zap, Lightbulb, Bot } from "lucide-react";
+import React, { useCallback, useMemo, useRef, useState } from "react";
+import RainbowControls from "./RainbowControls";
 
-const BlocklyRobotController = () => {
-  const blocklyDiv = useRef(null);
-  const workspaceRef = useRef(null);
-  const [code, setCode] = useState("");
-  const [output, setOutput] = useState("");
-  const [loaded, setLoaded] = useState(false);
-  const [isRunning, setIsRunning] = useState(false);
+const DEFAULT_ROBOT_URL = "http://192.168.4.1";
+const GAP_MS = 150;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  useEffect(() => {
-    const loadScript = (src) => {
-      return new Promise((resolve, reject) => {
-        const script = document.createElement("script");
-        script.src = src;
-        script.async = true;
-        script.onload = resolve;
-        script.onerror = reject;
-        document.body.appendChild(script);
-      });
-    };
+const NOTE_OPTIONS = [
+  "C3",
+  "D3",
+  "E3",
+  "F3",
+  "G3",
+  "A3",
+  "B3",
+  "C4",
+  "D4",
+  "E4",
+  "F4",
+  "G4",
+  "A4",
+  "B4",
+  "C5",
+  "D5",
+  "E5",
+  "F5",
+  "G5",
+  "A5",
+  "B5",
+  "C6",
+  "D6",
+  "E6",
+  "F6",
+  "G6",
+];
 
-    const initializeBlockly = async () => {
-      try {
-        await loadScript(
-          "https://cdnjs.cloudflare.com/ajax/libs/blockly/10.4.3/blockly.min.js"
-        );
-        await loadScript(
-          "https://cdnjs.cloudflare.com/ajax/libs/blockly/10.4.3/blocks.min.js"
-        );
-        await loadScript(
-          "https://cdnjs.cloudflare.com/ajax/libs/blockly/10.4.3/javascript.min.js"
-        );
+let uid = 1;
+const newId = () => String(uid++);
 
-        setTimeout(() => {
-          initBlockly();
-          setLoaded(true);
-          const style = document.createElement('style');
-          style.innerHTML = `
-            .blocklyTreeLabel {
-              font-size: 16px !important;
-              font-weight: 600 !important;
-              padding: 8px 16px 8px 0 !important;
-            }
-            .blocklyTreeRow {
-              height: auto !important;
-              min-height: 36px !important;
-              padding: 4px 0 !important;
-            }
-            .blocklyTreeRow[aria-label*="Motion"] .blocklyTreeLabel {
-              color: #4CAF50 !important;
-            }
-            .blocklyTreeRow[aria-label*="Display"] .blocklyTreeLabel {
-              color: #FF9800 !important;
-            }
-            .blocklyTreeRow[aria-label*="Sound"] .blocklyTreeLabel {
-              color: #E91E63 !important;
-            }
-            .blocklyTreeRow[aria-label*="Fan"] .blocklyTreeLabel {
-              color: #00BCD4 !important;
-            }
-            .blocklyTreeRow[aria-label*="Control"] .blocklyTreeLabel {
-              color: #673AB7 !important;
-            }
-          `;
-          document.head.appendChild(style);
-        }, 300);
-      } catch (error) {
-        console.error("Error loading Blockly:", error);
-      }
-    };
+export default function SimpleDragAndRun() {
+  const [robotUrl, setRobotUrl] = useState(DEFAULT_ROBOT_URL);
+  const [items, setItems] = useState([]);
+  const [running, setRunning] = useState(false);
+  const [log, setLog] = useState(
+    "👋 Drag actions into the sequence, tweak values, then press Run."
+  );
 
-    initializeBlockly();
-
-    return () => {
-      if (workspaceRef.current) {
-        workspaceRef.current.dispose();
-      }
-    };
-  }, []);
-
-  const initBlockly = () => {
-    if (!window.Blockly) return;
-
-    window.Blockly.Blocks["robot_move"] = {
-      init: function () {
-        this.appendDummyInput()
-          .appendField("🚗 Move")
-          .appendField(
-            new window.Blockly.FieldDropdown([
-              ["⬆️ Forward", "forward"],
-              ["⬇️ Backward", "backward"],
-            ]),
-            "DIRECTION"
-          )
-          .appendField("for")
-          .appendField(
-            new window.Blockly.FieldNumber(1, 0.1, 10, 0.1),
-            "DURATION"
-          )
-          .appendField("seconds");
-        this.setPreviousStatement(true, null);
-        this.setNextStatement(true, null);
-        this.setColour("#4CAF50");
-        this.setTooltip("Move the robot in a direction");
-        this.setHelpUrl("");
-      },
-    };
-
-    window.Blockly.Blocks["robot_turn"] = {
-      init: function () {
-        this.appendDummyInput()
-          .appendField("🔄 Turn")
-          .appendField(
-            new window.Blockly.FieldDropdown([
-              ["⬅️ Left", "left"],
-              ["➡️ Right", "right"],
-            ]),
-            "DIRECTION"
-          );
-        this.setPreviousStatement(true, null);
-        this.setNextStatement(true, null);
-        this.setColour("#4CAF50");
-        this.setTooltip("Turn the robot");
-        this.setHelpUrl("");
-      },
-    };
-
-    window.Blockly.Blocks["robot_light"] = {
-      init: function () {
-        this.appendDummyInput()
-          .appendField("🌈 Set light to rainbow effect");
-        this.setPreviousStatement(true, null);
-        this.setNextStatement(true, null);
-        this.setColour("#FF9800");
-        this.setTooltip("Activate rainbow ring effect");
-        this.setHelpUrl("");
-      },
-    };
-
-    window.Blockly.Blocks["robot_light_color"] = {
-      init: function () {
-        this.appendDummyInput()
-          .appendField("💡 Set light to")
-          .appendField(new window.Blockly.FieldColour("#ff0000"), "COLOUR");
-        this.setPreviousStatement(true, null);
-        this.setNextStatement(true, null);
-        this.setColour("#FF9800");
-        this.setTooltip("Set the robot's light color");
-        this.setHelpUrl("");
-      },
-    };
-
-    window.Blockly.Blocks["robot_buzzer"] = {
-      init: function () {
-        const noteField = new window.Blockly.FieldDropdown([
-          ["C", "C"],
-          ["D", "D"],
-          ["E", "E"],
-          ["F", "F"],
-          ["G", "G"],
-          ["A", "A"],
-          ["B", "B"],
-        ]);
-        
-        const scaleField = new window.Blockly.FieldDropdown(
-          this.getScaleOptions.bind(this)
-        );
-        
-        this.appendDummyInput()
-          .appendField("🔊 Play note")
-          .appendField(noteField, "NOTE")
-          .appendField("scale")
-          .appendField(scaleField, "SCALE");
-        this.setPreviousStatement(true, null);
-        this.setNextStatement(true, null);
-        this.setColour("#E91E63");
-        this.setTooltip("Play a musical note");
-        this.setHelpUrl("");
-      },
-      getScaleOptions: function() {
-        const note = this.getFieldValue("NOTE");
-        if (note === "A" || note === "B") {
-          return [["3", "3"], ["4", "4"], ["5", "5"]];
-        }
-        return [["3", "3"], ["4", "4"], ["5", "5"], ["6", "6"]];
-      }
-    };
-
-    window.Blockly.Blocks["robot_oled"] = {
-      init: function () {
-        this.appendDummyInput()
-          .appendField("📺 Display:")
-          .appendField(
-            new window.Blockly.FieldTextInput("Hello Robot!"),
-            "MESSAGE"
-          );
-        this.setPreviousStatement(true, null);
-        this.setNextStatement(true, null);
-        this.setColour("#FF9800");
-        this.setTooltip("Display message on LED screen");
-        this.setHelpUrl("");
-      },
-    };
-
-    window.Blockly.Blocks["robot_fan"] = {
-      init: function () {
-        this.appendDummyInput()
-          .appendField("🌀 Fan")
-          .appendField(
-            new window.Blockly.FieldDropdown([
-              ["ON", "on"],
-              ["OFF", "off"],
-            ]),
-            "STATE"
-          );
-        this.setPreviousStatement(true, null);
-        this.setNextStatement(true, null);
-        this.setColour("#00BCD4");
-        this.setTooltip("Turn fan on or off");
-        this.setHelpUrl("");
-      },
-    };
-
-    window.Blockly.Blocks["robot_wait"] = {
-      init: function () {
-        this.appendDummyInput()
-          .appendField("⏱️ Wait")
-          .appendField(
-            new window.Blockly.FieldNumber(1, 0.1, 10, 0.1),
-            "DURATION"
-          )
-          .appendField("seconds");
-        this.setPreviousStatement(true, null);
-        this.setNextStatement(true, null);
-        this.setColour("#673AB7");
-        this.setTooltip("Wait for a specified time");
-        this.setHelpUrl("");
-      },
-    };
-
-    window.Blockly.Blocks["robot_forever"] = {
-      init: function () {
-        this.appendDummyInput().appendField("🔁 Forever");
-        this.appendStatementInput("DO").setCheck(null);
-        this.setPreviousStatement(true, null);
-        this.setColour("#673AB7");
-        this.setTooltip("Repeat forever");
-        this.setHelpUrl("");
-      },
-    };
-
-    window.Blockly.Blocks["robot_stop"] = {
-      init: function () {
-        this.appendDummyInput().appendField("🛑 Stop");
-        this.setPreviousStatement(true, null);
-        this.setColour("#673AB7");
-        this.setTooltip("Stop the program");
-        this.setHelpUrl("");
-      },
-    };
-
-    window.Blockly.JavaScript["robot_move"] = function (block) {
-      const direction = block.getFieldValue("DIRECTION");
-      const duration = block.getFieldValue("DURATION");
-      return `robot.move('${direction}', ${duration});\n`;
-    };
-
-    window.Blockly.JavaScript["robot_turn"] = function (block) {
-      const direction = block.getFieldValue("DIRECTION");
-      return `robot.turn('${direction}');\n`;
-    };
-
-    window.Blockly.JavaScript["robot_light"] = function (block) {
-      return `robot.rainbowRing();\n`;
-    };
-
-    window.Blockly.JavaScript["robot_light_color"] = function (block) {
-      const colour = block.getFieldValue("COLOUR");
-      return `robot.setLight('${colour}');\n`;
-    };
-
-    window.Blockly.JavaScript["robot_buzzer"] = function (block) {
-      const note = block.getFieldValue("NOTE");
-      const scale = block.getFieldValue("SCALE");
-      return `robot.playNote('${note}', ${scale});\n`;
-    };
-
-    window.Blockly.JavaScript["robot_oled"] = function (block) {
-      const message = block.getFieldValue("MESSAGE");
-      return `robot.displayLED('${message}');\n`;
-    };
-
-    window.Blockly.JavaScript["robot_fan"] = function (block) {
-      const state = block.getFieldValue("STATE");
-      return `robot.setFan('${state}');\n`;
-    };
-
-    window.Blockly.JavaScript["robot_wait"] = function (block) {
-      const duration = block.getFieldValue("DURATION");
-      return `robot.wait(${duration});\n`;
-    };
-
-    window.Blockly.JavaScript["robot_forever"] = function (block) {
-      const branch = window.Blockly.JavaScript.statementToCode(block, "DO");
-      return `while (true) {\n${branch}}\n`;
-    };
-
-    window.Blockly.JavaScript["robot_stop"] = function (block) {
-      return `robot.stop();\n`;
-    };
-
-    const originalRepeatInit = window.Blockly.Blocks['controls_repeat_ext'].init;
-    window.Blockly.Blocks['controls_repeat_ext'].init = function() {
-      originalRepeatInit.call(this);
-      this.setColour("#673AB7");
-    };
-
-    const toolbox = {
-      kind: "categoryToolbox",
-      contents: [
-        {
-          kind: "category",
-          name: "🚗 Motion",
-          colour: "#4CAF50",
-          categorystyle: "motion_category",
-          contents: [
-            { kind: "block", type: "robot_move" },
-            { kind: "block", type: "robot_turn" },
-          ],
-        },
-        {
-          kind: "category",
-          name: "💡 Display",
-          colour: "#FF9800",
-          categorystyle: "display_category",
-          contents: [
-            { kind: "block", type: "robot_light" },
-            { kind: "block", type: "robot_light_color" },
-            { kind: "block", type: "robot_oled" }
-          ],
-        },
-        {
-          kind: "category",
-          name: "🔊 Sound",
-          colour: "#E91E63",
-          categorystyle: "sound_category",
-          contents: [{ kind: "block", type: "robot_buzzer" }],
-        },
-        {
-          kind: "category",
-          name: "🌀 Fan",
-          colour: "#00BCD4",
-          categorystyle: "fan_category",
-          contents: [{ kind: "block", type: "robot_fan" }],
-        },
-        {
-          kind: "category",
-          name: "🔁 Control",
-          colour: "#673AB7",
-          categorystyle: "control_category",
-          contents: [
-            { kind: "block", type: "robot_wait" },
-            {
-              kind: "block",
-              type: "controls_repeat_ext",
-              inputs: {
-                TIMES: {
-                  shadow: {
-                    type: "math_number",
-                    fields: { NUM: 3 },
-                  },
-                },
-                DO: {
-                  shadow: null,
-                },
-              },
-            },
-            { kind: "block", type: "robot_forever" },
-            { kind: "block", type: "robot_stop" },
-          ],
-        },
-      ],
-    };
-
-    const customTheme = window.Blockly.Theme.defineTheme('robotTheme', {
-      base: window.Blockly.Themes.Classic,
-      componentStyles: {
-        workspaceBackgroundColour: '#f8fafc',
-        toolboxBackgroundColour: '#ffffff',
-        toolboxForegroundColour: '#1f2937',
-        flyoutBackgroundColour: '#f3f4f6',
-        flyoutForegroundColour: '#111827',
-        flyoutOpacity: 0.95,
-        scrollbarColour: '#9ca3af',
-        insertionMarkerColour: '#ffffff',
-        insertionMarkerOpacity: 0.3,
-        scrollbarOpacity: 0.4,
-        cursorColour: '#d97706',
-      },
-      categoryStyles: {
-        motion_category: {
-          colour: '#4CAF50',
-        },
-        display_category: {
-          colour: '#FF9800',
-        },
-        sound_category: {
-          colour: '#E91E63',
-        },
-        fan_category: {
-          colour: '#00BCD4',
-        },
-        control_category: {
-          colour: '#673AB7',
-        },
-      },
-    });
-
-    workspaceRef.current = window.Blockly.inject(blocklyDiv.current, {
-      toolbox: toolbox,
-      grid: {
-        spacing: 25,
-        length: 3,
-        colour: "#e5e7eb",
-        snap: true,
-      },
-      zoom: {
-        controls: true,
-        wheel: true,
-        startScale: 0.95,
-        maxScale: 3,
-        minScale: 0.3,
-        scaleSpeed: 1.2,
-      },
-      trashcan: true,
-      sounds: true,
-      theme: customTheme,
-      renderer: 'zelos',
-    });
-
-    setTimeout(() => {
-      if (workspaceRef.current) {
-        window.Blockly.svgResize(workspaceRef.current);
-      }
-    }, 0);
+  // ----- Palette drag -----
+  const paletteDragStart = (e, type) => {
+    e.dataTransfer.setData("text/plain", type);
   };
 
-  const generateCode = () => {
-    if (workspaceRef.current && window.Blockly) {
-      const jsCode = window.Blockly.JavaScript.workspaceToCode(
-        workspaceRef.current
-      );
-      setCode(jsCode);
+  const dropZoneRef = useRef(null);
+  const onDragOver = (e) => e.preventDefault();
+  const onDrop = (e) => {
+    e.preventDefault();
+    const type = e.dataTransfer.getData("text/plain");
+    if (!type) return;
+    const add = (obj) => setItems((prev) => [...prev, obj]);
 
-      const lines = jsCode.split("\n").filter((l) => l.trim());
-      if (lines.length > 0) {
-        setOutput(
-          "✅ Ready to execute!\n\n" +
-            lines.map((l, i) => `Step ${i + 1}: ${l}`).join("\n")
-        );
-      } else {
-        setOutput("👋 Drag some blocks from the toolbox to get started!");
-      }
+    switch (type) {
+      case "move":
+        add({ id: newId(), type: "move", dir: "forward", seconds: 0.8 });
+        break;
+      case "beep":
+        add({ id: newId(), type: "beep" });
+        break;
+      case "note":
+        add({ id: newId(), type: "note", name: "C4", beats: 1 });
+        break;
+      case "mary":
+        add({ id: newId(), type: "mary" });
+        break;
+      case "rgb":
+        add({ id: newId(), type: "rgb", hex: "#00AEEF", r: 0, g: 128, b: 255 });
+        break;
+      case "lcd":
+        add({
+          id: newId(),
+          type: "lcd",
+          msg: "Hello Robot!",
+          row: 0,
+          align: "center",
+          hex: "#00AEEF",
+          r: 0,
+          g: 128,
+          b: 255,
+        });
+        break;
+      case "wait":
+        add({ id: newId(), type: "wait", seconds: 1 });
+        break;
+      case "rainbowStart":
+        add({
+          id: newId(),
+          type: "rainbowStart",
+          interval: 40,
+          sat: 255,
+          val: 160,
+        });
+        break;
+      case "rainbowStop":
+        add({ id: newId(), type: "rainbowStop" });
+        break;
+      default:
+        break;
     }
   };
 
-  useEffect(() => {
-    if (workspaceRef.current && loaded && window.Blockly) {
-      const updateCode = () => {
-        const jsCode = window.Blockly.JavaScript.workspaceToCode(
-          workspaceRef.current
-        );
-        setCode(jsCode);
-
-        const lines = jsCode.split("\n").filter((l) => l.trim());
-        if (lines.length > 0) {
-          setOutput(
-            "✅ Ready to execute!\n\n" +
-              lines.map((l, i) => `Step ${i + 1}: ${l}`).join("\n")
-          );
-        } else {
-          setOutput("👋 Drag some blocks from the toolbox to get started!");
-        }
-      };
-      
-      workspaceRef.current.addChangeListener(updateCode);
-      
-      return () => {
-        if (workspaceRef.current) {
-          workspaceRef.current.removeChangeListener(updateCode);
-        }
-      };
-    }
-  }, [loaded]);
-
-  const runCode = () => {
-    setIsRunning(true);
-    generateCode();
-    setTimeout(() => setIsRunning(false), 1000);
+  // ----- Update / reorder -----
+  const updateItem = (id, patch) =>
+    setItems((prev) =>
+      prev.map((it) => (it.id === id ? { ...it, ...patch } : it))
+    );
+  const removeItem = (id) =>
+    setItems((prev) => prev.filter((it) => it.id !== id));
+  const moveUp = (i) =>
+    setItems((prev) => (i <= 0 ? prev : swap(prev, i, i - 1)));
+  const moveDown = (i) =>
+    setItems((prev) => (i >= prev.length - 1 ? prev : swap(prev, i, i + 1)));
+  const swap = (arr, i, j) => {
+    const c = [...arr];
+    [c[i], c[j]] = [c[j], c[i]];
+    return c;
   };
+
+  // ----- Runner -----
+  const run = useCallback(async () => {
+    if (!items.length || running) return;
+    setRunning(true);
+    setLog("🚀 Executing…");
+
+    const base = robotUrl.replace(/\/+$/, "");
+    const stepLog = (t) => setLog((p) => p + "\n• " + t);
+
+    try {
+      for (const it of items) {
+        switch (it.type) {
+          case "move": {
+            const dir = it.dir === "backward" ? "back" : "fwd";
+            const ms = Math.max(
+              0,
+              Math.round(Number(it.seconds || 0.8) * 1000)
+            );
+            const body = new URLSearchParams({
+              l: dir,
+              r: dir,
+              ms: String(ms),
+            });
+            stepLog(`POST ${base}/motor  body: ${body.toString()}`);
+            await fetch(`${base}/motor`, {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body,
+            });
+            break;
+          }
+
+          case "beep": {
+            const url = `${base}/beep`;
+            stepLog(`GET ${url}`);
+            await fetch(url);
+            break;
+          }
+          case "note": {
+            const name = it.name || "C4";
+            const beats = Math.max(0.1, Number(it.beats) || 1);
+            const url = `${base}/note?name=${encodeURIComponent(
+              name
+            )}&beats=${encodeURIComponent(beats)}`;
+            stepLog(`GET ${url}`);
+            await fetch(url);
+            break;
+          }
+          case "mary": {
+            const url = `${base}/mary`;
+            stepLog(`GET ${url}`);
+            await fetch(url);
+            break;
+          }
+          case "rgb": {
+            const hasHex = it.hex && String(it.hex).trim().length >= 4;
+            if (hasHex) {
+              let hex = String(it.hex).trim();
+              if (!hex.startsWith("#")) hex = "#" + hex;
+              const body = new URLSearchParams({ hex });
+              stepLog(`POST ${base}/rgb  body: ${body.toString()}`);
+              await fetch(`${base}/rgb`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                },
+                body,
+              });
+            } else {
+              const r = clamp255(it.r),
+                g = clamp255(it.g),
+                b = clamp255(it.b);
+              const body = new URLSearchParams({
+                r: String(r),
+                g: String(g),
+                b: String(b),
+              });
+              stepLog(`POST ${base}/rgb  body: ${body.toString()}`);
+              await fetch(`${base}/rgb`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                },
+                body,
+              });
+            }
+            break;
+          }
+          case "lcd": {
+            const p = new URLSearchParams();
+            p.set("msg", it.msg || "");
+            p.set("row", String(Math.min(1, Math.max(0, Number(it.row) || 0))));
+            p.set("align", (it.align || "center").toLowerCase());
+            const hasHex = it.hex && String(it.hex).trim().length >= 4;
+            if (hasHex) {
+              let hex = String(it.hex).trim();
+              if (!hex.startsWith("#")) hex = "#" + hex;
+              p.set("hex", hex);
+            } else if (
+              it.r !== undefined ||
+              it.g !== undefined ||
+              it.b !== undefined
+            ) {
+              p.set("r", String(clamp255(it.r)));
+              p.set("g", String(clamp255(it.g)));
+              p.set("b", String(clamp255(it.b)));
+            }
+
+            stepLog(`POST ${base}/lcd  body: ${p.toString()}`);
+            await fetch(`${base}/lcd`, {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: p,
+            });
+            break;
+          }
+          case "wait": {
+            const ms = Math.max(0, Math.round(Number(it.seconds || 1) * 1000));
+            stepLog(`WAIT ${ms}ms`);
+            await sleep(ms);
+            break;
+          }
+          case "rainbowStart": {
+            const interval = Math.max(
+              5,
+              Math.min(1000, Number(it.interval) || 40)
+            );
+            const sat = clamp255(it.sat);
+            const val = clamp255(it.val);
+            const url = `${base}/fx/rainbow/start?interval=${encodeURIComponent(
+              interval
+            )}&sat=${encodeURIComponent(sat)}&val=${encodeURIComponent(val)}`;
+            stepLog(`GET ${url}`);
+            await fetch(url);
+            break;
+          }
+          case "rainbowStop": {
+            const url = `${base}/fx/rainbow/stop`;
+            stepLog(`GET ${url}`);
+            await fetch(url);
+            break;
+          }
+          default:
+            break;
+        }
+        await sleep(GAP_MS);
+      }
+      stepLog("✅ Done!");
+    } catch (e) {
+      console.error(e);
+      stepLog(`❌ Error: ${e.message || e}`);
+    } finally {
+      setRunning(false);
+    }
+  }, [items, robotUrl, running]);
+
+  // ----- UI -----
+  const palette = useMemo(
+    () => [
+      { type: "move", label: "🚗 Move" }, // NEW
+      { type: "beep", label: "🔔 Beep" },
+      { type: "note", label: "🎵 Note" },
+      { type: "mary", label: "🎶 Mary" },
+      { type: "rgb", label: "💡 RGB" },
+      { type: "lcd", label: "📺 LCD" },
+      { type: "wait", label: "⏱️ Wait" },
+      { type: "rainbowStart", label: "🌈 Rainbow Start" },
+      { type: "rainbowStop", label: "🛑 Rainbow Stop" },
+    ],
+    []
+  );
 
   return (
-    <div style={{
-      minHeight: "100vh",
-      width: "100vw",
-      background: "linear-gradient(to bottom right, #f3e7ff, #fce7f3, #dbeafe)",
-      padding: 0,
-      margin: 0
-    }}>
-      <div style={{ width: "100vw", maxWidth: "100vw", margin: 0, padding: 0 }}>
-        <div style={{
-          textAlign: "center",
-          marginBottom: 0,
-          padding: "2rem 0",
-          background: "linear-gradient(to bottom right, #111827, #581c87)",
-          width: "100%"
-        }}>
-          <div style={{
-            display: "inline-flex",
-            alignItems: "center",
-            gap: "0.75rem",
-            padding: "1rem 2rem",
-            marginBottom: "1rem"
-          }}>
-            <Bot style={{ width: "2.5rem", height: "2.5rem", color: "#c4b5fd" }} />
-            <h1 style={{
-              fontSize: "3.5rem",
-              fontWeight: "bold",
-              background: "linear-gradient(to right, #ffffffff, #f1e0e9ff)",
-              WebkitBackgroundClip: "text",
-              backgroundClip: "text",
-              color: "transparent",
-              margin: 0
-            }}>Block Buddy</h1>
+    <div style={{ minHeight: "100vh", padding: 16, background: "#f7f7fb" }}>
+      <h1 style={{ margin: 0, fontSize: 24 }}>Simple Drag & Run</h1>
+      <p style={{ marginTop: 6 }}>
+        Endpoints used: <code>/motor</code>, <code>/beep</code>,{" "}
+        <code>/note</code>, <code>/mary</code>, <code>/rgb</code>,{" "}
+        <code>/lcd</code>, <code>/fx/rainbow/start</code>,{" "}
+        <code>/fx/rainbow/stop</code>
+      </p>
+
+      <div style={{ display: "flex", gap: 16, marginTop: 12 }}>
+        {/* Palette */}
+        <div style={{ width: 220 }}>
+          <div style={{ fontWeight: 700, marginBottom: 8 }}>Palette</div>
+          <div style={{ display: "grid", gap: 8 }}>
+            {palette.map((p) => (
+              <div
+                key={p.type}
+                draggable
+                onDragStart={(e) => paletteDragStart(e, p.type)}
+                style={{
+                  userSelect: "none",
+                  padding: "10px 12px",
+                  border: "1px solid #ddd",
+                  borderRadius: 8,
+                  background: "white",
+                  cursor: "grab",
+                }}
+              >
+                {p.label}
+              </div>
+            ))}
           </div>
-          <p style={{
-            fontSize: "1.25rem",
-            color: "#e9d5ff",
-            fontWeight: 500
-          }}>
-            Where coding comes alive.
-          </p>
         </div>
 
-        <div style={{ backgroundColor: "white", overflow: "hidden", padding: 0 }}>
-          <div style={{
-            background: "linear-gradient(to bottom right, #eff6ff, #faf5ff)",
-            padding: "1.25rem",
-            margin: "0 0 1.5rem 0",
-            borderTop: "4px solid #93c5fd",
-            borderBottom: "4px solid #93c5fd",
-            boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.1)"
-          }}>
-            <h3 style={{
-              color: "#1e40af",
-              fontWeight: "bold",
-              fontSize: "1.125rem",
-              margin: "0 0 0.75rem",
-              display: "flex",
-              alignItems: "center",
-              gap: "0.5rem"
-            }}>
-              <Lightbulb style={{ width: "1.25rem", height: "1.25rem", color: "#eab308" }} />
-              Robot Instructions
-            </h3>
-            <pre style={{
-              color: "#1e3a8a",
-              fontSize: "0.875rem",
-              whiteSpace: "pre-wrap",
-              lineHeight: 1.625,
-              fontWeight: 500,
-              margin: 0
-            }}>
-              {output || '👋 Hi there, young coder!\n\nDrag blocks from the colorful menu on the left and snap them together to create your robot program.\n\n💡 Try this:\n1. Click "Motion"\n2. Drag a move block here\n3. Click "Run My Program!"'}
-            </pre>
-          </div>
+        {/* Sequence / Drop zone */}
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 700, marginBottom: 8 }}>Sequence</div>
 
-          <div style={{
-            display: "grid",
-            gridTemplateColumns: "2fr 1fr",
-            gap: "1.5rem",
-            margin: "0 1.5rem"
-          }}>
-            <div>
-              <div style={{
-                background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
-                borderRadius: "1.5rem",
-                border: "3px solid #a78bfa",
-                overflow: "hidden",
-                boxShadow: "0 25px 50px -12px rgba(0, 0, 0, 0.25), inset 0 2px 4px 0 rgba(255, 255, 255, 0.1)",
-                minHeight: "700px",
-                position: "relative"
-              }}>
-                {!loaded && (
-                  <div style={{
-                    height: "700px",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center"
-                  }}>
-                    <div style={{ textAlign: "center" }}>
-                      <Bot style={{ width: "4rem", height: "4rem", color: "#9333ea", margin: "0 auto 1rem" }} />
-                      <p style={{ fontSize: "1.25rem", fontWeight: 600, color: "#7c3aed" }}>
-                        Loading your coding playground...
-                      </p>
-                    </div>
-                  </div>
-                )}
-                <div ref={blocklyDiv} style={{ height: "700px", width: "100%", display: loaded ? "block" : "none" }} />
+          <div
+            ref={dropZoneRef}
+            onDragOver={onDragOver}
+            onDrop={onDrop}
+            style={{
+              minHeight: 220,
+              border: "2px dashed #bbb",
+              borderRadius: 10,
+              background: "#fff",
+              padding: 10,
+            }}
+          >
+            {items.length === 0 ? (
+              <div style={{ color: "#666", padding: 8 }}>
+                Drag actions here…
               </div>
-            </div>
-
-            <div>
-              <div style={{ display: "flex", gap: "0.75rem", marginBottom: "1.5rem" }}>
-                <button
-                  onClick={runCode}
-                  disabled={!loaded || isRunning}
+            ) : (
+              items.map((it, i) => (
+                <div
+                  key={it.id}
                   style={{
-                    flex: 1,
-                    background: "linear-gradient(to right, #22c55e, #10b981)",
-                    color: "white",
-                    fontWeight: "bold",
-                    padding: "1rem 1.5rem",
-                    borderRadius: "1rem",
-                    boxShadow: "0 10px 15px -3px rgba(0, 0, 0, 0.1)",
-                    display: "flex",
+                    display: "grid",
+                    gridTemplateColumns: "1fr auto",
                     alignItems: "center",
-                    justifyContent: "center",
-                    gap: "0.5rem",
-                    fontSize: "1rem",
-                    border: "none",
-                    cursor: loaded && !isRunning ? "pointer" : "not-allowed",
-                    opacity: !loaded || isRunning ? 0.5 : 1,
-                    height: "4rem"
+                    gap: 8,
+                    padding: 10,
+                    border: "1px solid #e5e7eb",
+                    borderRadius: 8,
+                    marginBottom: 8,
+                    background: "#fafafa",
                   }}
                 >
-                  <Play style={{ width: "1.25rem", height: "1.25rem" }} />
-                  {isRunning ? "Running..." : "Run!"}
-                </button>
-                <button
-                  onClick={() => {
-                    setIsRunning(false);
-                    setOutput("⏹️ Program stopped!");
-                  }}
-                  disabled={!loaded || !isRunning}
-                  style={{
-                    background: "linear-gradient(to right, #ef4444, #ec4899)",
-                    color: "white",
-                    fontWeight: "bold",
-                    padding: "1rem 1.5rem",
-                    borderRadius: "1rem",
-                    boxShadow: "0 10px 15px -3px rgba(0, 0, 0, 0.1)",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    gap: "0.5rem",
-                    border: "none",
-                    cursor: loaded && isRunning ? "pointer" : "not-allowed",
-                    opacity: !loaded || !isRunning ? 0.5 : 1,
-                    height: "4rem"
-                  }}
-                >
-                  <Zap style={{ width: "1.25rem", height: "1.25rem" }} />
-                  Stop
-                </button>
-              </div>
-              
-              <div style={{
-                background: "linear-gradient(to bottom right, #111827, #581c87)",
-                borderRadius: "1rem",
-                padding: "1.25rem",
-                height: "calc(700px - 4rem - 1.5rem - 3.5rem)",
-                overflow: "auto",
-                boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.1)",
-                border: "2px solid #a78bfa"
-              }}>
-                <div style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "0.5rem",
-                  marginBottom: "0.75rem"
-                }}>
-                  <div style={{ display: "flex", gap: "0.375rem" }}>
-                    <div style={{ width: "0.75rem", height: "0.75rem", borderRadius: "9999px", backgroundColor: "#ef4444" }} />
-                    <div style={{ width: "0.75rem", height: "0.75rem", borderRadius: "9999px", backgroundColor: "#eab308" }} />
-                    <div style={{ width: "0.75rem", height: "0.75rem", borderRadius: "9999px", backgroundColor: "#22c55e" }} />
+                  <div>
+                    {/* NEW: Move block UI */}
+                    {it.type === "move" && (
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: 8,
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <strong>🚗 Move</strong>
+                        <label>
+                          direction:
+                          <select
+                            value={it.dir}
+                            onChange={(e) =>
+                              updateItem(it.id, { dir: e.target.value })
+                            }
+                            style={{ marginLeft: 6 }}
+                          >
+                            <option value="forward">forward</option>
+                            <option value="backward">backward</option>
+                          </select>
+                        </label>
+                        <label>
+                          seconds:
+                          <input
+                            type="number"
+                            step="0.1"
+                            min="0"
+                            value={it.seconds}
+                            onChange={(e) =>
+                              updateItem(it.id, { seconds: e.target.value })
+                            }
+                            style={{ width: 80, marginLeft: 6 }}
+                          />
+                        </label>
+                      </div>
+                    )}
+
+                    {it.type === "beep" && <strong>🔔 Beep</strong>}
+
+                    {it.type === "note" && (
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: 8,
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <strong>🎵 Note</strong>
+                        <select
+                          value={it.name}
+                          onChange={(e) =>
+                            updateItem(it.id, { name: e.target.value })
+                          }
+                        >
+                          {NOTE_OPTIONS.map((n) => (
+                            <option key={n} value={n}>
+                              {n}
+                            </option>
+                          ))}
+                        </select>
+                        <label>
+                          beats:
+                          <input
+                            type="number"
+                            step="0.1"
+                            min="0.1"
+                            value={it.beats}
+                            onChange={(e) =>
+                              updateItem(it.id, { beats: e.target.value })
+                            }
+                            style={{ width: 70, marginLeft: 6 }}
+                          />
+                        </label>
+                      </div>
+                    )}
+
+                    {it.type === "mary" && (
+                      <strong>🎶 Mary Had a Little Lamb</strong>
+                    )}
+
+                    {it.type === "rgb" && (
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: 8,
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <strong>💡 RGB</strong>
+                        <label title="Prefer hex if set">
+                          hex:
+                          <input
+                            type="text"
+                            value={it.hex}
+                            onChange={(e) =>
+                              updateItem(it.id, { hex: e.target.value })
+                            }
+                            placeholder="#RRGGBB"
+                            style={{ width: 110, marginLeft: 6 }}
+                          />
+                        </label>
+                        <span style={{ opacity: 0.6 }}>(or r,g,b)</span>
+                        <label>
+                          r:
+                          <input
+                            type="number"
+                            min="0"
+                            max="255"
+                            value={it.r}
+                            onChange={(e) =>
+                              updateItem(it.id, { r: e.target.value })
+                            }
+                            style={{ width: 70, marginLeft: 4 }}
+                          />
+                        </label>
+                        <label>
+                          g:
+                          <input
+                            type="number"
+                            min="0"
+                            max="255"
+                            value={it.g}
+                            onChange={(e) =>
+                              updateItem(it.id, { g: e.target.value })
+                            }
+                            style={{ width: 70, marginLeft: 4 }}
+                          />
+                        </label>
+                        <label>
+                          b:
+                          <input
+                            type="number"
+                            min="0"
+                            max="255"
+                            value={it.b}
+                            onChange={(e) =>
+                              updateItem(it.id, { b: e.target.value })
+                            }
+                            style={{ width: 70, marginLeft: 4 }}
+                          />
+                        </label>
+                      </div>
+                    )}
+
+                    {it.type === "lcd" && (
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: 8,
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <strong>📺 LCD</strong>
+                        <input
+                          type="text"
+                          value={it.msg}
+                          onChange={(e) =>
+                            updateItem(it.id, { msg: e.target.value })
+                          }
+                          placeholder="Message"
+                          style={{ flex: 1, minWidth: 180 }}
+                        />
+                        <label>
+                          row:
+                          <select
+                            value={it.row}
+                            onChange={(e) =>
+                              updateItem(it.id, { row: Number(e.target.value) })
+                            }
+                            style={{ marginLeft: 6 }}
+                          >
+                            <option value={0}>0</option>
+                            <option value={1}>1</option>
+                          </select>
+                        </label>
+                        <label>
+                          align:
+                          <select
+                            value={it.align}
+                            onChange={(e) =>
+                              updateItem(it.id, { align: e.target.value })
+                            }
+                            style={{ marginLeft: 6 }}
+                          >
+                            <option value="left">left</option>
+                            <option value="center">center</option>
+                            <option value="right">right</option>
+                          </select>
+                        </label>
+                        <label title="Backlight (prefer hex if set)">
+                          hex:
+                          <input
+                            type="text"
+                            value={it.hex}
+                            onChange={(e) =>
+                              updateItem(it.id, { hex: e.target.value })
+                            }
+                            placeholder="#00AEEF"
+                            style={{ width: 110, marginLeft: 6 }}
+                          />
+                        </label>
+                        <span style={{ opacity: 0.6 }}>(or r,g,b)</span>
+                        <label>
+                          r:
+                          <input
+                            type="number"
+                            min="0"
+                            max="255"
+                            value={it.r}
+                            onChange={(e) =>
+                              updateItem(it.id, { r: e.target.value })
+                            }
+                            style={{ width: 70, marginLeft: 4 }}
+                          />
+                        </label>
+                        <label>
+                          g:
+                          <input
+                            type="number"
+                            min="0"
+                            max="255"
+                            value={it.g}
+                            onChange={(e) =>
+                              updateItem(it.id, { g: e.target.value })
+                            }
+                            style={{ width: 70, marginLeft: 4 }}
+                          />
+                        </label>
+                        <label>
+                          b:
+                          <input
+                            type="number"
+                            min="0"
+                            max="255"
+                            value={it.b}
+                            onChange={(e) =>
+                              updateItem(it.id, { b: e.target.value })
+                            }
+                            style={{ width: 70, marginLeft: 4 }}
+                          />
+                        </label>
+                      </div>
+                    )}
+
+                    {it.type === "wait" && (
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: 8,
+                          alignItems: "center",
+                        }}
+                      >
+                        <strong>⏱️ Wait</strong>
+                        <label>
+                          seconds:
+                          <input
+                            type="number"
+                            step="0.1"
+                            min="0"
+                            value={it.seconds}
+                            onChange={(e) =>
+                              updateItem(it.id, { seconds: e.target.value })
+                            }
+                            style={{ width: 80, marginLeft: 6 }}
+                          />
+                        </label>
+                      </div>
+                    )}
+
+                    {it.type === "rainbowStart" && (
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: 8,
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <strong>🌈 Rainbow Start</strong>
+                        <label>
+                          interval (ms):
+                          <input
+                            type="number"
+                            min="5"
+                            max="1000"
+                            step="5"
+                            value={it.interval}
+                            onChange={(e) =>
+                              updateItem(it.id, {
+                                interval: Number(e.target.value),
+                              })
+                            }
+                            style={{ width: 90, marginLeft: 6 }}
+                          />
+                        </label>
+                        <label>
+                          sat (0–255):
+                          <input
+                            type="number"
+                            min="0"
+                            max="255"
+                            value={it.sat}
+                            onChange={(e) =>
+                              updateItem(it.id, { sat: Number(e.target.value) })
+                            }
+                            style={{ width: 90, marginLeft: 6 }}
+                          />
+                        </label>
+                        <label>
+                          val (0–255):
+                          <input
+                            type="number"
+                            min="0"
+                            max="255"
+                            value={it.val}
+                            onChange={(e) =>
+                              updateItem(it.id, { val: Number(e.target.value) })
+                            }
+                            style={{ width: 90, marginLeft: 6 }}
+                          />
+                        </label>
+                      </div>
+                    )}
+
+                    {it.type === "rainbowStop" && (
+                      <strong>🛑 Rainbow Stop</strong>
+                    )}
                   </div>
-                  <h3 style={{
-                    color: "#86efac",
-                    fontFamily: "monospace",
-                    fontSize: "0.875rem",
-                    fontWeight: "bold",
-                    margin: "0 0 0 0.5rem"
-                  }}>📝 Your Code</h3>
+
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button onClick={() => moveUp(i)} title="Up">
+                      ↑
+                    </button>
+                    <button onClick={() => moveDown(i)} title="Down">
+                      ↓
+                    </button>
+                    <button onClick={() => removeItem(it.id)} title="Delete">
+                      ✕
+                    </button>
+                  </div>
                 </div>
-                <pre style={{
-                  color: "#86efac",
-                  fontFamily: "monospace",
-                  fontSize: "0.75rem",
-                  whiteSpace: "pre-wrap",
-                  lineHeight: 1.625,
-                  margin: 0
-                }}>
-                  {code || '// Drag blocks and click "Run" to see your code here!\n// Let\'s create something awesome! 🚀'}
-                </pre>
-              </div>
+              ))
+            )}
+          </div>
+
+          {/* Controls */}
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <button
+              onClick={() => setItems([])}
+              disabled={running}
+              style={{ padding: "8px 12px" }}
+            >
+              Clear
+            </button>
+            <button
+              onClick={run}
+              disabled={!items.length || running}
+              style={{
+                padding: "8px 12px",
+                background: "#22c55e",
+                color: "white",
+                border: "none",
+                borderRadius: 6,
+                cursor: !items.length || running ? "not-allowed" : "pointer",
+                opacity: !items.length || running ? 0.6 : 1,
+              }}
+            >
+              {running ? "Running…" : "Run"}
+            </button>
+            <div
+              style={{
+                marginLeft: "auto",
+                display: "flex",
+                gap: 8,
+                alignItems: "center",
+              }}
+            >
+              <span>Robot URL:</span>
+              <input
+                value={robotUrl}
+                onChange={(e) => setRobotUrl(e.target.value)}
+                style={{ width: 260, padding: "6px 8px" }}
+                placeholder="http://192.168.4.1"
+              />
             </div>
           </div>
 
-          <div style={{
-            background: "linear-gradient(to right, #f3e7ff, #fce7f3, #dbeafe)",
-            padding: "1.5rem",
-            margin: "1.5rem 0 0 0"
-          }}>
-            <h3 style={{
-              fontSize: "1.25rem",
-              fontWeight: "bold",
-              color: "#1f2937",
-              margin: "0 0 1rem",
-              textAlign: "center"
-            }}>
-              🎮 Quick Guide - Make Your Robot Come Alive!
-            </h3>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: "1rem" }}>
-              <div style={{
-                backgroundColor: "white",
-                padding: "1rem",
-                borderRadius: "0.75rem",
-                boxShadow: "0 4px 6px -1px rgba(0, 0, 0, 0.1)",
-                border: "2px solid #86efac"
-              }}>
-                <div style={{ fontSize: "1.875rem", marginBottom: "0.5rem" }}>🚗</div>
-                <strong style={{ fontSize: "1rem", display: "block", marginBottom: "0.25rem", color: "#16a34a" }}>Motion</strong>
-                <p style={{ fontSize: "0.75rem", color: "#4b5563", margin: "0.25rem 0 0" }}>Move & turn</p>
-              </div>
-              <div style={{
-                backgroundColor: "white",
-                padding: "1rem",
-                borderRadius: "0.75rem",
-                boxShadow: "0 4px 6px -1px rgba(0, 0, 0, 0.1)",
-                border: "2px solid #fdba74"
-              }}>
-                <div style={{ fontSize: "1.875rem", marginBottom: "0.5rem" }}>💡</div>
-                <strong style={{ fontSize: "1rem", display: "block", marginBottom: "0.25rem", color: "#ea580c" }}>Display</strong>
-                <p style={{ fontSize: "0.75rem", color: "#4b5563", margin: "0.25rem 0 0" }}>Lights & messages</p>
-              </div>
-              <div style={{
-                backgroundColor: "white",
-                padding: "1rem",
-                borderRadius: "0.75rem",
-                boxShadow: "0 4px 6px -1px rgba(0, 0, 0, 0.1)",
-                border: "2px solid #f472b6"
-              }}>
-                <div style={{ fontSize: "1.875rem", marginBottom: "0.5rem" }}>🔊</div>
-                <strong style={{ fontSize: "1rem", display: "block", marginBottom: "0.25rem", color: "#db2777" }}>Sound</strong>
-                <p style={{ fontSize: "0.75rem", color: "#4b5563", margin: "0.25rem 0 0" }}>Play notes</p>
-              </div>
-              <div style={{
-                backgroundColor: "white",
-                padding: "1rem",
-                borderRadius: "0.75rem",
-                boxShadow: "0 4px 6px -1px rgba(0, 0, 0, 0.1)",
-                border: "2px solid #67e8f9"
-              }}>
-                <div style={{ fontSize: "1.875rem", marginBottom: "0.5rem" }}>🌀</div>
-                <strong style={{ fontSize: "1rem", display: "block", marginBottom: "0.25rem", color: "#0891b2" }}>Fan</strong>
-                <p style={{ fontSize: "0.75rem", color: "#4b5563", margin: "0.25rem 0 0" }}>ON/OFF</p>
-              </div>
-              <div style={{
-                backgroundColor: "white",
-                padding: "1rem",
-                borderRadius: "0.75rem",
-                boxShadow: "0 4px 6px -1px rgba(0, 0, 0, 0.1)",
-                border: "2px solid #c4b5fd"
-              }}>
-                <div style={{ fontSize: "1.875rem", marginBottom: "0.5rem" }}>🔁</div>
-                <strong style={{ fontSize: "1rem", display: "block", marginBottom: "0.25rem", color: "#7c3aed" }}>Control</strong>
-                <p style={{ fontSize: "0.75rem", color: "#4b5563", margin: "0.25rem 0 0" }}>Loops & wait</p>
-              </div>
-            </div>
+          {/* Log */}
+          <div
+            style={{
+              marginTop: 10,
+              background: "#0f172a",
+              color: "#c7d2fe",
+              minHeight: 140,
+              borderRadius: 8,
+              padding: 10,
+              whiteSpace: "pre-wrap",
+              fontFamily:
+                "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas",
+              fontSize: 13,
+            }}
+          >
+            {log}
+          </div>
+
+          {/* Optional: direct controls for rainbow */}
+          <div style={{ marginTop: 16 }}>
+            <RainbowControls defaultUrl={robotUrl} />
           </div>
         </div>
       </div>
     </div>
   );
-};
+}
 
-export default BlocklyRobotController;
+function clamp255(v) {
+  const n = Math.round(Number(v || 0));
+  if (Number.isNaN(n)) return 0;
+  return Math.min(255, Math.max(0, n));
+}
